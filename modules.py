@@ -3,20 +3,37 @@
 """
 Created on Tue Sep  1 22:38:41 2020
 
-CUB-RAM modules.
+Modules used in CUB-RAM investigations.
 
 @author: piotr
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models
+from torchvision.models import resnet18
+from torchvision.models.resnet import BasicBlock, ResNet
+from torchvision.models.utils import load_state_dict_from_url
 
 from torch.autograd import Variable
 from torch.distributions import Normal
 
 import numpy as np
-from utils import gausskernel, conv_outshape
+from utils import gausskernel, conv_outshape, out_shape
 
+model_urls = {
+    'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
+    'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
+    'resnet50': 'https://download.pytorch.org/models/resnet50-19c8e357.pth',
+    'resnet101': 'https://download.pytorch.org/models/resnet101-5d3b4d8f.pth',
+    'resnet152': 'https://download.pytorch.org/models/resnet152-b121ed2d.pth',
+    'resnext50_32x4d': 'https://download.pytorch.org/models/resnext50_32x4d-7cdf4587.pth',
+    'resnext101_32x8d': 'https://download.pytorch.org/models/resnext101_32x8d-8ba56ff5.pth',
+    'wide_resnet50_2': 'https://download.pytorch.org/models/wide_resnet50_2-95faca4d.pth',
+    'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
+}
+
+#TODO: metadata var or fn returning len&dims of output (crude and ours)
 class crude_retina(object):
     """
     A retina that extracts a foveated glimpse phi around location l. 
@@ -37,6 +54,7 @@ class crude_retina(object):
         self.gauss = None
         self.coords = None
         self.vis_data = None #variable to store visualisation data
+        self.out_shape = (3,g,g)
         
     def foveate(self, x, l, v=0):
         """
@@ -152,23 +170,50 @@ class crude_retina(object):
         if ((from_x < 0) or (from_y < 0) or (to_x > T[1]) or (to_y > T[0])):
             return True
         return False
+
+class ResNet18_short(ResNet):
+    #Resnet18 with ablated avgpool, flatten and fc
+    def __init__(self):
+        super(ResNet18_short, self).__init__(BasicBlock, [2, 2, 2, 2])
+        
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
     
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x) 
+        
+        return x
     
-#TODO variations in conv stack and FC sizes. Pass conv as params and/or write 
-#a new class for different merge/FC strats?
-#TODO: recalculate conv_out shape for a smaller patch size? You could have a fn
-#that calculates the shape easily if you store convs in a list.
+class sensor_resnet18(nn.Module):
+    def __init__(self, retina, pretrained=True):
+        super(sensor_resnet18, self).__init__()
+        self.retina = retina
+        
+        self.resnet18 = ResNet18_short()
+        if pretrained:
+            self.resnet18.load_state_dict(resnet18(pretrained=True).state_dict())
+        
+        self.out_shape = out_shape(self.resnet18, self.retina.out_shape)
+        self.n_patches = retina.k if type(retina) is crude_retina else 1
+        
+    def forward(self, x, l_t_prev):
+        phi = self.retina.foveate(x, l_t_prev)
+        
+        #split up phi into patches, process individually
+        out = []
+        for i in range(self.n_patches):
+            x = phi[:,i,:,:,:] #select patch
+            out.append(self.resnet18(x))
+
+        return out #n_patches of g_t's, each g_t has shape of self.out_shape
+    
 class glimpse_network(nn.Module):
     """
-    Combines the "what" and the "where" into a glimpse feature vector `g_t`.
-
-    - "what": glimpse extracted from the retina, the visual vector
-    - "where": location tuple where glimpse was extracted, the location vector.
-
-    Concretely, feeds the output of the retina `phi` through conv layers. 
-    The glimpse location vector l_t_prev is fed to a fc layer that upscales it. 
-    These two outputs are multiplied together element-wise, for each patch.
-
     Args
     ----
     - x: a 4D Tensor of shape (B, C, H, W). The minibatch of images.
@@ -196,14 +241,8 @@ class glimpse_network(nn.Module):
         hw = (self.retina.g, self.retina.g)
         for c in self.convs:
             hw = conv_outshape(hw, c)
-        self.conv_out = hw[0] * hw[1] * self.convs[-1].out_channels #19x19x32
+        self.out_shape = hw[0] * hw[1] * self.convs[-1].out_channels #19x19x32
         
-#        # Location stack, one FC pathway for each retinal patch
-#        for patch in range(self.n_patches):
-#            name = 'fc_loc{}'.format(patch)
-#            fc_loc = nn.Linear(2, self.conv_out)
-#            setattr(self, name, fc_loc)
-
     def forward(self, x, l_t_prev):
         #generate glimpse phi from image x
         phi = self.retina.foveate(x, l_t_prev)
@@ -217,12 +256,6 @@ class glimpse_network(nn.Module):
             for conv in self.convs:
                 x = F.relu(conv(x))
             
-#            #Location stack
-#            fc_loc = 'fc_loc{}'.format(i) 
-#            x_l = F.relu(getattr(self, fc_loc)(l_t_prev))
-            
-            #combine 'where' and 'what'
-#            g_t = torch.mul(x, x_l.view_as(x)) 
             out.append(x)
 
         return out #n_patches of g_t's, each g_t has shape of self.conv_out

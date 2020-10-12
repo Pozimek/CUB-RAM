@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from utils import conv_outshape, ir
 
-from modules import baseline_network, crude_retina, glimpse_network
+from modules import baseline_network, crude_retina, sensor_resnet18
 from modules import classification_network, location_network, ConvLSTM
 
 class CUBRAM_baseline(nn.Module):
@@ -29,7 +29,6 @@ class CUBRAM_baseline(nn.Module):
         - g: size of the square patches extracted by the retina.
         - k: number of patches to extract per glimpse.
         - s: scaling factor that controls the size of successive patches.
-        - vis_size: size of visual vector.
         - std: standard deviation of the Gaussian policy.
         """
         super(CUBRAM_baseline, self).__init__()
@@ -42,14 +41,17 @@ class CUBRAM_baseline(nn.Module):
         self.retina = crude_retina(g, k, s)
         #outputs a list of g_t maps (k, (sensor.conv_out))
         #each map has 32 channels
-        self.sensor = glimpse_network(self.retina)
+        self.sensor = sensor_resnet18(self.retina)
         
         # Memory
-        rnn_input = hidden_channels = [32] * k
+        rnn_input = [self.sensor.out_shape[0]] * k
+        hidden_channels = [32] * k
         self.rnn = ConvLSTM(rnn_input, hidden_channels, 3)
         
         # Auxiliary Modules
-        h_t_shape = self.sensor.conv_out
+        h_t_shape = 32*self.sensor.out_shape[1:].numel()
+        
+        self.sensor.out_shape.numel()
         fc_size = 512
         self.locator = location_network(h_t_shape, fc_size, std)
         self.classifier = classification_network(k*h_t_shape, fc_size, 200)
@@ -106,12 +108,17 @@ class CUBRAM_baseline(nn.Module):
         return log_probas, locs, log_pis, baselines
     
     
+    
+    
+    
+    
 class debug_model(nn.Module):
+    """
+    Debugging code. Ignore it :)
+    remove rnn and location net, keep retina (for input resolution 
+    invariance) and glimpse+classifier in some form.
+    """
     def __init__(self):
-        """
-        remove rnn and location net, keep retina (for input resolution 
-        invariance) and glimpse+classifier in some form.
-        """
         super(debug_model, self).__init__()
         self.name = "debug"
         self.std = 0.05
@@ -124,7 +131,7 @@ class debug_model(nn.Module):
         #OUT: 2x[3x150x150]
         
 #        ##
-#        self.res18 = resnet18(pretrained=True) #XXX you are here
+#        self.res18 = resnet18(pretrained=True)
 #        self.res18.fc = nn.Linear(self.res18.fc.in_features, 200)
 #        ##
         

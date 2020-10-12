@@ -46,7 +46,7 @@ class Trainer(object):
         self.best_valid_acc = 0.
         self.counter = 0
         self.lr = C.training.init_lr
-        self.optimizer = optim.SGD(params, lr=0.001, momentum=0.9)
+        self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9)
         self.batch_size = self.C.training.batch_size
         
         # set up logging

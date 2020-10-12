@@ -100,6 +100,17 @@ def conv_outshape(in_shape, conv_layer):
                          conv_layer.stride[dim] + 1)
     return tuple(out_shape)
 
+def out_shape(module, in_shape):
+    """
+    Computes an nn.Module's output shape given an input shape. 
+    Skips batch dimension.
+    """
+    device = next(module.parameters()).device
+    T = torch.zeros(in_shape).unsqueeze(0).to(device)
+    with torch.no_grad():
+        O = module(T)
+    return O.shape[1:]
+
 #Gauss(sigma,x,y) function, 1D
 def gauss(sigma,x,y,mean=0):
     d = np.linalg.norm(np.array([x,y]))

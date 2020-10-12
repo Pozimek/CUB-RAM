@@ -39,11 +39,10 @@ def main(config):
                                    std=[0.229, 0.224, 0.225])])
     
     dataset = CUBDataset(transform = transform)
-    collate = collate_pad
     
     loader = torch.utils.data.DataLoader(
             dataset, batch_size=config.training.batch_size, 
-            sampler=RandomSampler(dataset), collate_fn = collate,
+            sampler=RandomSampler(dataset), collate_fn = collate_pad,
             num_workers=config.training.num_workers, 
             pin_memory=kwargs['pin_memory'],)
     
