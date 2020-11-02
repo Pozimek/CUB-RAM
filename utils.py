@@ -78,7 +78,8 @@ def showPIL(PIL, size=(8,8), cmap=None):
     
 def showTensor(tensor, size=(8,8), cmap=None):
     if tensor.device.type == 'cuda': tensor = tensor.cpu()
-    array = np.moveaxis(tensor.numpy(), 0, -1)
+#    array = np.moveaxis(tensor.numpy(), 0, -1) #why did you even do this?
+    array = tensor.numpy()
     showArray(array, size, cmap)
  
     

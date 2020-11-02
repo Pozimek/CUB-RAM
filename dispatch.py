@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Sep  1 22:07:46 2020
+Created on Mon Nov  2 17:44:16 2020
 
-Training dispatch script, CUB-RAM.
+A new training dispatch script taking into account the DT-RAM paper.
+
 @author: piotr
 """
-#TODO: Figure out how to structure trainer/tester objects wrt research scripts
-# ANS: If models will have different outputs or different loss handling then 
-# the functionality will be implemented in the model class - the Trainer will call
-# those functions. Or if the different training regimes will be tested then the 
-# functionality will be passed as a param to the trainer.
-#TODO: flatten and clean up config file structure
-
 import os
 import matplotlib as mpl
 if os.environ.get('DISPLAY','') == '':
@@ -46,13 +40,41 @@ def main(config):
             num_workers=config.training.num_workers, 
             pin_memory=kwargs['pin_memory'],)
     
-#    model = CUBRAM_baseline(config.name, config.RAM.foveal_size, 
-#                            config.RAM.n_patches, config.RAM.scaling, 
-#                            config.RAM.std, config.gpu)
+
+    # 1 - Train single-step RAM
+    print("Now training 1-step RAM.\n")
     model = ff_r18()
     trainer = Trainer(config, loader, model)
     trainer.train()
-
+    
+    # Extract new resnet18 weights
+    weights = model.resnet18.state_dict()
+    
+    # Delete old training objects
+    del(trainer)
+    del(loader)
+    del(dataset)
+    
+    # 2 - Iteratively increase number of timesteps
+    for steps in range(2,6):
+        print("Now training {}-step RAM.\n".format(steps))
+    
+    dataset2 = CUBDataset(transform = transform)
+    loader2 = torch.utils.data.DataLoader(
+            dataset2, batch_size=config.training.batch_size, 
+            sampler=RandomSampler(dataset2), collate_fn = collate_pad,
+            num_workers=config.training.num_workers, 
+            pin_memory=kwargs['pin_memory'],)
+    
+    model2 = CUBRAM_baseline(config.name, config.RAM.foveal_size, 
+                            config.RAM.n_patches, config.RAM.scaling, 
+                            config.RAM.std, config.gpu)
+    model2.sensor.resnet18.load_state_dict(weights)
+    del(model)
+    
+    trainer2 = Trainer(config, loader2, model2)
+    trainer2.train()
+    
 if __name__ == '__main__':
     config = get_ymlconfig('./config.yml')
     main(config)

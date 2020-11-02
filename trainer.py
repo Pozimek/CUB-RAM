@@ -20,10 +20,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
-
+from torch.optim import lr_scheduler
 
 class Trainer(object):
-    
     def __init__(self, C, data_loader, model):
         self.C = C
         
@@ -42,12 +41,17 @@ class Trainer(object):
             sum([p.data.nelement() for p in self.model.parameters()])))
         
         # misc params
+        self.batch_size = self.C.training.batch_size
         self.start_epoch = 0
         self.best_valid_acc = 0.
+        self.es_acc = 0.
         self.counter = 0
         self.lr = C.training.init_lr
         self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9)
-        self.batch_size = self.C.training.batch_size
+        self.lr_scheduler = lr_scheduler.StepLR(self.optimizer, 
+                                                step_size=10, gamma=0.5)
+        #TODO scheduler hyperparams to config file
+        
         
         # set up logging
         if C.tensorboard:
@@ -69,11 +73,15 @@ class Trainer(object):
                 self.num_train, self.num_valid))
         for epoch in range(self.start_epoch, self.C.training.epochs):
             print('\nEpoch: {}/{} - LR: {:.6f}'.format(
-                    epoch+1, self.C.training.epochs, self.lr))
+                    epoch+1, self.C.training.epochs, 
+                    self.optimizer.param_groups[0]['lr']))
             
             # Train and validate
             train_loss, train_acc = self.train_one_epoch(epoch)
             valid_loss, valid_acc = self.validate(epoch)
+            
+            # Update lr
+            self.lr_scheduler.step()
             
             # Log to tensorboard
             if self.C.tensorboard:
@@ -97,13 +105,15 @@ class Trainer(object):
                  }, is_best)
             
             # Early stopping
-            ES_best = valid_acc > (self.best_valid_acc + self.C.training.delta)
+            ES_best = valid_acc > (self.es_acc + self.C.training.delta)
+            self.es_acc = max(valid_acc + self.C.training.delta, self.es_acc)
             self.counter = self.counter + 1 if not ES_best else 0
             if self.C.training.es and (self.counter > self.C.training.patience):
                 print("[!] No improvement in a while, early stopping.")
                 break
             
-        print("Training has ended.")
+        print("Training has ended, best val accuracy was {:.6f}.".format(
+                self.best_valid_acc))
         self.writer.close()
         
     def train_one_epoch(self, epoch):
@@ -131,19 +141,19 @@ class Trainer(object):
                 # extract prediction
                 prediction = torch.max(log_probas, 1)[1].detach()
                 
-                # compute reward
-                R = (prediction == y).float()
-                #XXX TODO: cleanup baselines shape, starting from modules.py
-                baselines = baselines.squeeze()
-                R = R.unsqueeze(1).repeat(1, self.model.timesteps)
-                adjusted_R = R - baselines.detach()
-
-                # hybrid loss 
+#                # compute reward
+#                R = (prediction == y).float()
+#                #XXX TODO: cleanup baselines shape, starting from modules.py
+#                baselines = baselines.squeeze()
+#                R = R.unsqueeze(1).repeat(1, self.model.timesteps)
+#                adjusted_R = R - baselines.detach()
+#
+#                # hybrid loss 
                 loss_classify = F.nll_loss(log_probas, y)
-                loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1) #sum timesteps
-                loss_reinforce = torch.mean(loss_reinforce, dim=0) #avg batch
-                loss_baseline = F.mse_loss(baselines, R)
-                total_loss = loss_classify + loss_reinforce + loss_baseline
+#                loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1) #sum timesteps
+#                loss_reinforce = torch.mean(loss_reinforce, dim=0) #avg batch
+#                loss_baseline = F.mse_loss(baselines, R)
+                total_loss = loss_classify #+ loss_reinforce + loss_baseline
                 
                 # compute gradients and update
                 total_loss.backward()
@@ -155,7 +165,7 @@ class Trainer(object):
                 
                 # update meters
                 loss_act.update(loss_classify.item(), self.batch_size) 
-                loss_base.update(loss_baseline.item(), self.batch_size)
+#                loss_base.update(loss_baseline.item(), self.batch_size)
                 losses.update(total_loss.item(), self.batch_size)
                 accs.update(acc, self.batch_size)
                 
@@ -206,17 +216,17 @@ class Trainer(object):
                     prediction = torch.max(log_probas, 1)[1].detach()
                     
                     # compute reward
-                    baselines = baselines.squeeze()
-                    R = (prediction == y).float()
-                    R = R.unsqueeze(1).repeat(1, self.model.timesteps)
-                    adjusted_R = R - baselines.detach()
-                    
-                    # hybrid loss
+#                    baselines = baselines.squeeze()
+#                    R = (prediction == y).float()
+#                    R = R.unsqueeze(1).repeat(1, self.model.timesteps)
+#                    adjusted_R = R - baselines.detach()
+#                    
+#                    # hybrid loss
                     loss_classify = F.nll_loss(log_probas, y)
-                    loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1)  
-                    loss_reinforce = torch.mean(loss_reinforce, dim=0)
-                    loss_baseline = F.mse_loss(baselines, R)
-                    total_loss = loss_classify + loss_reinforce + loss_baseline
+#                    loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1)  
+#                    loss_reinforce = torch.mean(loss_reinforce, dim=0)
+#                    loss_baseline = F.mse_loss(baselines, R)
+                    total_loss = loss_classify# + loss_reinforce + loss_baseline
                     
                     # compute accuracy
                     correct = prediction == y
@@ -225,7 +235,7 @@ class Trainer(object):
                     # update meters
                     #These are averaged, so no need to change anything
                     loss_act.update(loss_classify.item(), self.batch_size) 
-                    loss_base.update(loss_baseline.item(), self.batch_size)
+#                    loss_base.update(loss_baseline.item(), self.batch_size)
                     losses.update(total_loss.item(), self.batch_size)
                     accs.update(acc, self.batch_size)
                     

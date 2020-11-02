@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Sep  1 22:07:46 2020
+Created on Tue Oct 27 20:32:13 2020
 
-Training dispatch script, CUB-RAM.
+Curriculum learning test.
+
 @author: piotr
 """
-#TODO: Figure out how to structure trainer/tester objects wrt research scripts
-# ANS: If models will have different outputs or different loss handling then 
-# the functionality will be implemented in the model class - the Trainer will call
-# those functions. Or if the different training regimes will be tested then the 
-# functionality will be passed as a param to the trainer.
-#TODO: flatten and clean up config file structure
 
 import os
 import matplotlib as mpl
@@ -46,12 +41,38 @@ def main(config):
             num_workers=config.training.num_workers, 
             pin_memory=kwargs['pin_memory'],)
     
-#    model = CUBRAM_baseline(config.name, config.RAM.foveal_size, 
-#                            config.RAM.n_patches, config.RAM.scaling, 
-#                            config.RAM.std, config.gpu)
+
+    # Part 1 of curriculum training
     model = ff_r18()
     trainer = Trainer(config, loader, model)
     trainer.train()
+    
+    # Extract new resnet18 weights
+    weights = model.resnet18.state_dict()
+    
+    # Delete old training objects
+    
+    del(trainer)
+    del(loader)
+    del(dataset)
+    
+    # Part 2 of curriculum training
+    dataset2 = CUBDataset(transform = transform)
+    loader2 = torch.utils.data.DataLoader(
+            dataset2, batch_size=config.training.batch_size, 
+            sampler=RandomSampler(dataset2), collate_fn = collate_pad,
+            num_workers=config.training.num_workers, 
+            pin_memory=kwargs['pin_memory'],)
+    
+    model2 = CUBRAM_baseline(config.name, config.RAM.foveal_size, 
+                            config.RAM.n_patches, config.RAM.scaling, 
+                            config.RAM.std, config.gpu)
+    model2.sensor.resnet18.load_state_dict(weights)
+    del(model)
+    
+    trainer2 = Trainer(config, loader2, model2)
+    trainer2.train()
+    
 
 if __name__ == '__main__':
     config = get_ymlconfig('./config.yml')

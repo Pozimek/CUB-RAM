@@ -18,8 +18,10 @@ from torchvision.models.utils import load_state_dict_from_url
 from torch.autograd import Variable
 from torch.distributions import Normal
 
+from kornia import translate
+
 import numpy as np
-from utils import gausskernel, conv_outshape, out_shape
+from utils import gausskernel, conv_outshape, out_shape, ir
 
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
@@ -33,7 +35,6 @@ model_urls = {
     'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
 }
 
-#TODO: metadata var or fn returning len&dims of output (crude and ours)
 class crude_retina(object):
     """
     A retina that extracts a foveated glimpse phi around location l. 
@@ -390,6 +391,101 @@ class ConvLSTM(nn.Module):
 ##END OF ConvLSTM Code
 
 
+######
+#Active ConvLSTM
+######
+#TODO comment documentation
+"""
+500x500 scene -> 16x16 latent space
+100x100 patch -> 4x4 latent patch
+"""
+#TODO: write a *good* description of what's happening in this fn.
+def remap(x, l_t_prev, mem_shape, scaling):
+    # magnitude scaling factor correction
+    x_mem = x*scaling 
+    
+    # true memory space fixation coordinates (y,x)
+    mem_coords = (0.5 * (l_t_prev + 1.0) * torch.tensor(mem_shape).cuda())
+    
+    # pad x on bottom-right to match mem_shape
+    pad_right = mem_shape[-1] - x.shape[-1]
+    pad_bottom = mem_shape[-2] - x.shape[-2]
+    x_mem = F.pad(x_mem, (0, pad_right, 0, pad_bottom))
+
+    # true top-left pixel location in memory space
+    topleft = mem_coords - (torch.tensor(x.shape[-2:], device=x.device)-1)/2
+        
+    # translate patches into correct positions
+    x_mem = translate(x_mem, topleft.flip(1))
+    #TODO: flip probably redundant in latest kornia
+    return x_mem
+
+class ActiveConvLSTMCell(ConvLSTMCell):
+    def __init__(self, input_shape, mem_shape, kernel_size, scaling):
+        super(ActiveConvLSTMCell, self).__init__(
+                input_shape[0], mem_shape[0], kernel_size)
+        self.scaling = scaling
+        self.mem_size = mem_shape[1:]
+        
+    def forward(self, x, h, c, l_t_prev):
+        cf = torch.sigmoid(
+                remap(self.Wxf(x), l_t_prev, self.mem_size, self.scaling) 
+                + self.Whf(h)) #forget gate
+        ci = torch.sigmoid(
+                remap(self.Wxi(x), l_t_prev, self.mem_size, self.scaling)
+                + self.Whi(h)) #input gate
+        cc = cf * c + ci * torch.tanh(
+                remap(self.Wxg(x), l_t_prev, self.mem_size, self.scaling)
+                + self.Whg(h)) #new memory
+        co = torch.sigmoid(
+                remap(self.Wxo(x), l_t_prev, self.mem_size, self.scaling)
+                + self.Who(h)) #output gate
+        ch = co * torch.tanh(cc) #new state
+        
+        return ch, cc
+
+class ActiveConvLSTM(nn.Module):
+    def __init__(self, input_shapes, mem_shapes, kernel_size, scaling):
+        super(ActiveConvLSTM, self).__init__()
+        self.input_shapes = input_shapes
+        self.mem_shapes = mem_shapes
+        self.num_cells = len(mem_shapes)
+        self.internal_state = [] #list of (h, c) tensors for each cell
+        
+        #Instantiate ConvLSTM Cells
+        for i in range(self.num_cells):
+            name = 'cell{}'.format(i)
+            cell = ActiveConvLSTMCell(input_shapes[i], mem_shapes[i], 
+                                      kernel_size, scaling[i])
+            setattr(self, name, cell)
+    
+    def reset(self, B=1):
+        self.internal_state = [None for cell in range(self.num_cells)]
+    
+    def forward(self, x, l_t_prev):
+        #Iterate over all cells
+        for i in range(self.num_cells):
+            patch = x[i]
+            cell = getattr(self,'cell{}'.format(i))
+            
+            #initialize memory if beginning of sequence
+            if self.internal_state[i] == None:
+                B, _, H, W = patch.size()
+                h, c = cell.init_hidden(B, self.mem_shapes[i][0], 
+                                        self.mem_shapes[i][-2:])
+                self.internal_state[i] = (h, c)
+
+            #forward pass
+            h, c = self.internal_state[i]
+            new_h, new_c = cell(patch, h, c, l_t_prev)
+            self.internal_state[i] = (new_h, new_c)
+        
+        h_out = [hi for hi, _ in self.internal_state]
+        return h_out
+######
+#ENDOF Active ConvLSTM
+######
+
 class location_network(nn.Module):
     """
     Uses the internal state h_t of the ConvLSTM to produce the location 
@@ -421,9 +517,10 @@ class location_network(nn.Module):
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, 2)
 
-    def forward(self, h_t):
+    def forward(self, x):
         # compute mean
-        mu = F.relu(self.fc1(h_t.flatten(1,-1).detach()))
+        #TODO consistency in flattening in/out of model.py
+        mu = F.relu(self.fc1(x.flatten(1,-1).detach())) 
         mu = torch.tanh(self.fc2(mu))
 
         # reparametrization trick (?)
@@ -445,7 +542,7 @@ class location_network(nn.Module):
 
 class classification_network(nn.Module):
     """
-    Uses the RNN internal state h_t to classify the input minibatch.
+    Uses the RNN internal state h_t to classify the image.
 
     Args
     ----
