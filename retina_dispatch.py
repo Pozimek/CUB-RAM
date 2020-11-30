@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon Nov  2 17:44:16 2020
+Created on Tue Nov 17 18:40:09 2020
 
-A new training dispatch script taking into account the DT-RAM paper. Implements
-curriculum learning.
+Retina training script, following curriculum learning from dispatch.py.
 
 @author: piotr
 """
@@ -14,12 +13,15 @@ if os.environ.get('DISPLAY','') == '':
     print('no display found. Using non-interactive Agg backend')
     mpl.use('Agg')
 import torch
-from utils import get_ymlconfig, showTensor
-from trainer import Trainer
-from CUB_loader import CUBDataset, collate_pad
-from model import CUBRAM_baseline, ff_r18, RAM_baseline
 from torchvision.transforms import Compose, ToTensor, Normalize
 from torch.utils.data.sampler import RandomSampler
+
+from utils import get_ymlconfig, showTensor
+from CUB_loader import CUBDataset, collate_pad
+from trainer import Trainer
+from model import CUBRAM_baseline, ff_r18, RAM_baseline
+from modules import retinocortical_sensor, crude_retina
+
 
 def main(config):
     torch.manual_seed(config.seed)
@@ -38,36 +40,32 @@ def main(config):
             sampler=RandomSampler(dataset), collate_fn = collate_pad,
             num_workers=config.training.num_workers, 
             pin_memory=kwargs['pin_memory'],)
+
+    retina = retinocortical_sensor()
+#    retina = crude_retina(config.RAM.foveal_size, config.RAM.n_patches, 
+#                          config.RAM.scaling, config.gpu)
     
-#    # 1 - Pretrain feature extractor
+    # 1 - Pretrain feature extractor
+    r18 = ff_r18(retina=retina, pretrained=False)
+    config.name = "curriculum-r18-retina"
+    r18_trainer = Trainer(config, loader, r18)
+    r18_trainer.train()
+    r18_weights = r18.resnet18.state_dict()
+    
+#    # 1 - Load in pretrained feature extractor
+#    w_path = os.path.join(config.ckpt_dir, config.name+"_best.pth.tar")
 #    r18 = ff_r18()
-#    config.name = "curriculum-r18"
-#    r18_trainer = Trainer(config, loader, r18)
-#    r18_trainer.train()
+#    r18.load_state_dict(torch.load(w_path)['model_state'])
 #    r18_weights = r18.resnet18.state_dict()
     
-    # 1 - Load in pretrained feature extractor
-    w_path = os.path.join(config.ckpt_dir, "curriculum-r18_best.pth.tar")
-    r18 = ff_r18()
-    r18.load_state_dict(torch.load(w_path)['model_state'])
-    r18_weights = r18.resnet18.state_dict()
-#    fc1_weights = r18.fc1.state_dict()
-#    fc2_weights = r18.fc2.state_dict()
-    
     # 2 - Train RAM, iteratively increasing number of timesteps
-    config.name = "curriculum-vanilla-RAM2-1"
-#    model = CUBRAM_baseline(config.name, config.RAM.foveal_size, 
-#                            config.RAM.n_patches, config.RAM.scaling, 
-#                            config.RAM.std, config.gpu)
-    #TODO: pass retina object, remove deprecated params
-    model = RAM_baseline(config.name, config.RAM.foveal_size, 
-                            config.RAM.n_patches, config.RAM.scaling, 
-                            config.RAM.std, config.gpu)
+    namestring = "retina-RAM-testv2-{}"
+    config.name = namestring.format(0)
+#    model = CUBRAM_baseline(config.name, config.RAM.std, retina, config.gpu)
+    model = RAM_baseline(config.name, config.RAM.std, retina, config.gpu)
     
     #transfer pretrained weights
     model.sensor.resnet18.load_state_dict(r18_weights)
-#    model.rnn.fc_in.load_state_dict(fc1_weights)
-#    model.classifier.fc.load_state_dict(fc2_weights)
     
     #cleanup
     del(r18)
@@ -76,7 +74,7 @@ def main(config):
     for steps in range(2,6):
         print("Now training {}-step RAM.\n".format(steps))
         model.set_timesteps(steps)
-        config.name = "curriculum-vanilla-RAM2-{}".format(steps)
+        config.name = namestring.format(steps)
         trainer = Trainer(config, loader, model)
         trainer.train()
     #TODO config file restructure

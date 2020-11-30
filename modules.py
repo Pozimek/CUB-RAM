@@ -23,6 +23,10 @@ from kornia import translate
 import numpy as np
 from utils import gausskernel, conv_outshape, out_shape, ir
 
+from retinavision.retina import Retina
+from retinavision.cortex import Cortex
+import os
+
 model_urls = {
     'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth',
     'resnet34': 'https://download.pytorch.org/models/resnet34-333f7ec4.pth',
@@ -35,6 +39,75 @@ model_urls = {
     'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
 }
 
+class retinocortical_sensor(object):
+    """
+    First software retina wrapper, hardcoded 16k retina. Very inefficient in 
+    batch processing, lots of typecasting, assumes gpu=True. Just horrible.
+    """
+    def __init__(self, gpu=True):
+        self.k = 1 #one "patch"
+        self.sigma_base = 0.5
+        self.mean_rf = 1
+        self.c_sigma_base = 1.0
+        self.target_d5 = 1.0
+        self.out_shape = (3,273,500)
+        
+        retpath = os.path.join(os.getcwd(), 'retina_data', 'ret16k_{}_{}_{}.pkl')
+        cortpath = os.path.join(os.getcwd(), 'retina_data', 'cort16k_{}_{}_{}.pkl')
+        Llocpath = cortpath.format(self.c_sigma_base, self.target_d5, 'Lloc')
+        Rlocpath = cortpath.format(self.c_sigma_base, self.target_d5, 'Rloc')
+        Lcoeffpath = cortpath.format(self.c_sigma_base, self.target_d5, 'Lcoeff')
+        Rcoeffpath = cortpath.format(self.c_sigma_base, self.target_d5, 'Rcoeff')
+        
+        self.R = Retina(gpu=gpu)
+        self.R.loadLoc(retpath.format(self.sigma_base, self.mean_rf, 'loc'))
+        self.R.loadCoeff(retpath.format(self.sigma_base, self.mean_rf, 'coeff'))
+#        if gpu: self.R._cudaRetina.set_samplingfields(self.R.loc, self.R.coeff) #prepare
+        self.R.prepare((500,500), (250,250))
+        
+        self.C = Cortex(gpu=gpu)
+        self.C.loadLocs(Llocpath, Rlocpath)
+        self.C.loadCoeffs(Lcoeffpath, Rcoeffpath)
+        
+    def foveate(self, x, l_t_prev):
+        phi = []
+        B, C, H, W = x.shape
+
+        # denormalize coords of patch center
+        T = torch.tensor([H,W]).float().cuda()
+        coords = self.denormalize(T, l_t_prev)
+        
+        for i, sample in enumerate(x):
+            fixation = (coords[i,0].item(), coords[i,1].item())
+            #gpu retina bug workaround
+            if fixation[0] == 0: 
+                fixation = (fixation[0] + 1, fixation[1])
+            if fixation[1] == 0:
+                fixation = (fixation[0], fixation[1] + 1)
+            if fixation[0] == H:
+                fixation = (fixation[0] - 1, fixation[1])
+            if fixation[1] == W:
+                fixation = (fixation[0], fixation[1] - 1)
+            
+            img = np.moveaxis(sample.numpy(), 0, -1)
+            img = np.uint8(img*255) #XXX retina only works with uint8 right now
+            
+            V = self.R.sample(img, fixation)
+            c_img = torch.tensor(self.C.cort_img(V)).permute(2,0,1)
+            phi.append(c_img.unsqueeze(0).type(torch.float32))
+        
+        #rebuild batch, add glimpse dimension
+        phi = torch.cat(phi).unsqueeze(1).cuda()
+        
+        return phi
+    
+    def denormalize(self, T, coords):
+        """
+        Convert coordinates in the range [-1, 1] to range [0, T] 
+        where T is the (H, W) size of the image.
+        """
+        return (0.5 * ((coords + 1.0) * T)).long()
+
 class crude_retina(object):
     """
     A retina that extracts a foveated glimpse phi around location l. 
@@ -46,10 +119,11 @@ class crude_retina(object):
     - k: number of patches to extract in the glimpse.
     - s: scaling factor that controls the size of successive patches.
     """
-    def __init__(self, g, k, s):
+    def __init__(self, g, k, s, gpu):
         self.g = g
         self.k = k
         self.s = s
+        self.gpu = gpu
         self.sigma = np.pi*s
         self.lowpass = False #TODO: fix sigma formula. Lowpass off until then
         self.gauss = None
@@ -78,6 +152,8 @@ class crude_retina(object):
         size = self.g
         if self.gauss is None: 
             self.gauss = gausskernel(self.sigma, x.shape[1]).cuda()
+            
+        if self.gpu: x = x.cuda() #XXX
 
         # extract k patches of increasing size
         for i in range(self.k):
@@ -96,7 +172,7 @@ class crude_retina(object):
             #lowpass filter
             if self.lowpass: phi[i] = F.conv2d(phi[i], self.gauss, 
                padding=self.gauss.shape[-1]//2, groups=x.shape[1]) 
-            phi[i] = F.avg_pool2d(phi[i], k)
+            phi[i] = F.avg_pool2d(phi[i], k) #XXX
 
         # add an empty glimpse dimension (k), concatenate along it
         for i in range(len(phi)):
@@ -486,9 +562,34 @@ class ActiveConvLSTM(nn.Module):
 #ENDOF Active ConvLSTM
 ######
 
+class FC_RNN(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(FC_RNN, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.hidden_state = None
+
+        self.fc_in = nn.Linear(input_size, hidden_size)
+        self.fc_h = nn.Linear(hidden_size, hidden_size)
+        
+    def reset(self):
+        self.hidden_state = None
+
+    def forward(self, x):
+        B, L = x.shape
+        if self.hidden_state == None:
+            h_t_prev = Variable(torch.zeros(B, self.hidden_size)).cuda()
+            
+        h1 = self.fc_in(x)
+        h2 = self.fc_h(h_t_prev)
+        h_t = F.relu(h1 + h2)
+        h_t_prev = h_t        
+        
+        return h_t
+
 class location_network(nn.Module):
     """
-    Uses the internal state h_t of the ConvLSTM to produce the location 
+    Uses the internal state h_t of the recurrent net to produce the location 
     coordinates l_t for the next time step.
 
     Feeds h_t through a hidden fc layer followed by a tanh to clamp the output 
@@ -539,7 +640,6 @@ class location_network(nn.Module):
 
         return log_pi, l_t
 
-
 class classification_network(nn.Module):
     """
     Uses the RNN internal state h_t to classify the image.
@@ -566,6 +666,14 @@ class classification_network(nn.Module):
         
         return y_p
 
+class classification_network_short(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(classification_network_short, self).__init__()
+        self.fc = nn.Linear(input_size, output_size)
+
+    def forward(self, h_t):
+        y_p = F.log_softmax(self.fc(h_t), dim=1)
+        return y_p
 
 class baseline_network(nn.Module):
     """

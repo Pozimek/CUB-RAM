@@ -120,7 +120,7 @@ class Trainer(object):
         self.model.train()
         self.data_loader.dataset.train()
         
-        losses = AverageMeter()
+        loss_t = AverageMeter()
         accs = AverageMeter()
         loss_act = AverageMeter() 
         loss_base = AverageMeter()
@@ -129,51 +129,56 @@ class Trainer(object):
         
         #loader: img, label, parts
         with tqdm(total=self.num_train) as pbar:
-            for i, (x, y, _) in enumerate(self.data_loader):
+            for i, (x, y, y_locs) in enumerate(self.data_loader):
                 self.optimizer.zero_grad()
                 if self.C.gpu:
-                    x, y = x.cuda(), y.cuda()
-                x, y = Variable(x), Variable(y) #TODO: is this redundant?
+                    y = y.cuda()
+                x, y = Variable(x), Variable(y) #TODO: deprecated, check version
+                if self.model.require_locs: x = (x, y_locs)
                 
                 # classify image
                 log_probas, locs, log_pi, baselines = self.model(x)
                 
-                # extract prediction
-                prediction = torch.max(log_probas, 1)[1].detach()
-                
+#                # extract prediction
+#                prediction = torch.max(log_probas[-1], 1)[1].detach()
+#                
 #                # compute reward
-#                R = (prediction == y).float()
-#                #XXX TODO: cleanup baselines shape, starting from modules.py
 #                baselines = baselines.squeeze()
+#                R = (prediction == y).float()
 #                R = R.unsqueeze(1).repeat(1, self.model.timesteps)
 #                adjusted_R = R - baselines.detach()
 #
-#                # hybrid loss 
-                loss_classify = F.nll_loss(log_probas, y)
+#                # intermediate classification supervision
+#                Y = y.repeat(1, self.model.timesteps)
+#                loss_classify = F.nll_loss(log_probas, Y)
+#                
 #                loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1) #sum timesteps
 #                loss_reinforce = torch.mean(loss_reinforce, dim=0) #avg batch
 #                loss_baseline = F.mse_loss(baselines, R)
-                total_loss = loss_classify #+ loss_reinforce + loss_baseline
+#                total_loss = loss_classify + loss_reinforce + loss_baseline
                 
-                # compute gradients and update
+                # compute losses, gradients and update
+                losses = self.model.loss(log_probas, log_pi, baselines, y)
+                total_loss = sum(losses) if type(losses) is tuple else losses
                 total_loss.backward()
                 self.optimizer.step()
                 
                 # compute accuracy
-                correct = prediction == y
+                correct = torch.max(log_probas[:,-1], 1)[1].detach() == y
                 acc = 100 * (correct.sum().item() / self.batch_size)
                 
                 # update meters
-                loss_act.update(loss_classify.item(), self.batch_size) 
-#                loss_base.update(loss_baseline.item(), self.batch_size)
-                losses.update(total_loss.item(), self.batch_size)
+                if type(losses) is tuple:
+                    loss_act.update(losses[0].item(), self.batch_size) 
+                    loss_base.update(losses[2].item(), self.batch_size)
+                loss_t.update(total_loss.item(), self.batch_size)
                 accs.update(acc, self.batch_size)
                 
                 # log to tensorboard
                 if self.C.tensorboard:
                     iteration = epoch * len(self.data_loader) + i
                     self.writer.add_scalar('Loss (Detailed)/Training', 
-                                           losses.avg, iteration)
+                                           loss_t.avg, iteration)
                     self.writer.add_scalar('Accuracy (Detailed)/Training',
                                            accs.avg, iteration)
                     self.writer.add_scalars('Partial Losses/Training',{
@@ -188,23 +193,24 @@ class Trainer(object):
                 pbar.update(self.C.training.batch_size)
             
             print("\nTrain epoch {} - avg acc: {:.2f} | avg loss: {:.3f}".format(
-                epoch, accs.avg, losses.avg))
-            return losses.avg, accs.avg
+                epoch, accs.avg, loss_t.avg))
+            return loss_t.avg, accs.avg
                 
     def validate(self, epoch):
         self.model.eval()
         self.data_loader.dataset.test()
         
-        losses = AverageMeter()
+        loss_t = AverageMeter()
         accs = AverageMeter()
         loss_act = AverageMeter()
         loss_base = AverageMeter()
         
-        for i, (x, y, _) in enumerate(self.data_loader):
+        for i, (x, y, y_locs) in enumerate(self.data_loader):
             with torch.no_grad():
                 if self.C.gpu:
-                    x, y = x.cuda(), y.cuda()
+                    y = y.cuda()
                 x, y = Variable(x), Variable(y)
+                if self.model.require_locs: x = (x, y_locs)
                 
                 # M sample duplication to account for stochasticity
                 for j in range(self.C.training.M):
@@ -212,38 +218,26 @@ class Trainer(object):
                     # classify batch
                     log_probas, locs, log_pi, baselines = self.model(x)
                     
-                    # extract prediction
-                    prediction = torch.max(log_probas, 1)[1].detach()
-                    
-                    # compute reward
-#                    baselines = baselines.squeeze()
-#                    R = (prediction == y).float()
-#                    R = R.unsqueeze(1).repeat(1, self.model.timesteps)
-#                    adjusted_R = R - baselines.detach()
-#                    
-#                    # hybrid loss
-                    loss_classify = F.nll_loss(log_probas, y)
-#                    loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1)  
-#                    loss_reinforce = torch.mean(loss_reinforce, dim=0)
-#                    loss_baseline = F.mse_loss(baselines, R)
-                    total_loss = loss_classify# + loss_reinforce + loss_baseline
+                    losses = self.model.loss(log_probas, log_pi, baselines, y)
+                    total_loss = sum(losses) if type(losses) is tuple else losses
                     
                     # compute accuracy
-                    correct = prediction == y
+                    correct = torch.max(log_probas[:,-1], 1)[1].detach() == y
                     acc = 100 * (correct.sum().item() / self.batch_size)
                     
                     # update meters
                     #These are averaged, so no need to change anything
-                    loss_act.update(loss_classify.item(), self.batch_size) 
-#                    loss_base.update(loss_baseline.item(), self.batch_size)
-                    losses.update(total_loss.item(), self.batch_size)
+                    if type(losses) is tuple:
+                        loss_act.update(losses[0].item(), self.batch_size) 
+                        loss_base.update(losses[2].item(), self.batch_size)
+                    loss_t.update(total_loss.item(), self.batch_size)
                     accs.update(acc, self.batch_size)
                     
                 # log to tensorboard
                 if self.C.tensorboard:
                     iteration = epoch * len(self.data_loader) + i
                     self.writer.add_scalar('Loss (Detailed)/Training', 
-                                           losses.avg, iteration)
+                                           loss_t.avg, iteration)
                     self.writer.add_scalar('Accuracy (Detailed)/Training',
                                            accs.avg, iteration)
                     self.writer.add_scalars('Partial Losses/Training',{
@@ -251,19 +245,19 @@ class Trainer(object):
                             "Base_Loss" : loss_base.avg}, iteration)
         
         print("Val epoch {} - avg acc: {:.2f} | avg loss: {:.3f}".format(
-                epoch, accs.avg, losses.avg))
-        return losses.avg, accs.avg
+                epoch, accs.avg, loss_t.avg))
+        return loss_t.avg, accs.avg
         
     def save_checkpoint(self, state, is_best):
         """
         If is_best, a second file with the suffix `_best` is created.
         """
-        filename = self.model.name + '_ckpt.pth.tar'
+        filename = self.C.name + '_ckpt.pth.tar'
         ckpt_path = os.path.join(self.C.ckpt_dir, filename)
         torch.save(state, ckpt_path)
 
         if is_best:
-            filename = self.model.name + '_best.pth.tar'
+            filename = self.C.name + '_best.pth.tar'
             shutil.copyfile(ckpt_path, os.path.join(self.C.ckpt_dir, filename))
             
     def load_checkpoint(self, best=False):
