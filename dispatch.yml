@@ -7,13 +7,13 @@ seed: 1
 gpu: True
 rgb: True
 RAM:
-  foveal_size: 224     #size of high-res patch
-  n_patches: 1
-  scaling: 2    #scale of successive patches
+  foveal_size: 37     #size of high-res patch
+  n_patches: 2
+  scaling: 10    #scale of successive patches
   std: 0.09           #location net gaussian policy standard deviation
 training:
   batch_size: 16
-  num_workers: 6
+  num_workers: 0
   shuffle: True
   epochs: 420
   init_lr: 5.0e-3

@@ -46,8 +46,8 @@ def main(config):
 #                          config.RAM.scaling, config.gpu)
     
     # 1 - Pretrain feature extractor
-    r18 = ff_r18(retina=retina, pretrained=False)
     config.name = "curriculum-r18-retina"
+    r18 = ff_r18(retina=retina, pretrained=True) #retina+pretrained gives 0.5%
     r18_trainer = Trainer(config, loader, r18)
     r18_trainer.train()
     r18_weights = r18.resnet18.state_dict()
@@ -57,9 +57,9 @@ def main(config):
 #    r18 = ff_r18()
 #    r18.load_state_dict(torch.load(w_path)['model_state'])
 #    r18_weights = r18.resnet18.state_dict()
-    
+   
     # 2 - Train RAM, iteratively increasing number of timesteps
-    namestring = "retina-RAM-testv2-{}"
+    namestring = "retina-RAM-testv3-{}"
     config.name = namestring.format(0)
 #    model = CUBRAM_baseline(config.name, config.RAM.std, retina, config.gpu)
     model = RAM_baseline(config.name, config.RAM.std, retina, config.gpu)
@@ -72,6 +72,9 @@ def main(config):
     
     #train
     for steps in range(2,6):
+        if steps != 2:
+            best_path = os.path.join(config.ckpt_dir, config.name+"_best.pth.tar")
+            model.load_state_dict(torch.load(best_path)['model_state'])
         print("Now training {}-step RAM.\n".format(steps))
         model.set_timesteps(steps)
         config.name = namestring.format(steps)

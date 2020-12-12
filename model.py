@@ -151,6 +151,7 @@ class RAM_baseline(nn.Module):
         - std: standard deviation of the Gaussian policy.
         """
         super(RAM_baseline, self).__init__()
+        self.require_locs = False
         self.name = name
         self.std = std
         self.gpu = gpu
@@ -158,12 +159,12 @@ class RAM_baseline(nn.Module):
         
         # Sensor
         self.retina = retina
-        k = self.retina.k
+        self.k = self.retina.k #num of patches
         self.sensor = sensor_resnet18(self.retina)
         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
         
         # Memory
-        rnn_input = self.sensor.out_shape[0]*k
+        rnn_input = self.sensor.out_shape[0]
         rnn_hidden = 1024
         self.rnn = FC_RNN(rnn_input, rnn_hidden)
         
@@ -185,6 +186,41 @@ class RAM_baseline(nn.Module):
 
         return l_t
     
+    def set_timesteps(self, n):
+        print("\nWas using {} timesteps, now using {} timesteps.".format(
+                self.timesteps, n))
+        self.timesteps = n
+        
+    def forward(self, x):
+        # initialize
+        locs, log_pis, baselines, log_probas = [], [], [], []
+        l_t_prev = self.reset(B=x.shape[0])
+        
+        # process minibatch
+        for t in range(self.timesteps):
+            g_t = self.sensor(x, l_t_prev)
+            g_t = self.avgpool(torch.cat(g_t,dim=-1)).squeeze()
+            h_t = self.rnn(g_t)
+            
+            log_pi, l_t = self.locator(h_t)
+            h_t_flat = h_t.flatten(1,-1)
+            b_t = self.baseliner(h_t_flat).squeeze(0) 
+            y_p = self.classifier(h_t_flat)
+            l_t_prev = l_t
+            
+            # store tensors
+            locs.append(l_t)
+            baselines.append(b_t)
+            log_pis.append(log_pi)
+            log_probas.append(y_p)
+        
+        # convert list to tensors and reshape
+        baselines = torch.stack(baselines).transpose(1, 0)
+        log_pis = torch.stack(log_pis).transpose(1, 0)
+        log_probas = torch.stack(log_probas).transpose(1, 0)
+        
+        return log_probas, locs, log_pis, baselines
+
     def loss(self, *args):
         """
         Computes the hybrid loss (with intermediate classification loss)
@@ -210,45 +246,7 @@ class RAM_baseline(nn.Module):
         loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1) #sum timesteps
         loss_reinforce = torch.mean(loss_reinforce, dim=0) #avg batch
         loss_baseline = F.mse_loss(baselines, R)
-        return loss_classify, loss_reinforce, loss_baseline
-        
-    
-    def set_timesteps(self, n):
-        print("\nWas using {} timesteps, now using {} timesteps.".format(
-                self.timesteps, n))
-        self.timesteps = n
-        
-    def forward(self, x):
-        # initialize
-        locs, log_pis, baselines, log_probas = [], [], [], []
-        l_t_prev = self.reset(B=x.shape[0])
-        
-        # process minibatch
-        for t in range(self.timesteps):
-            g_t = self.sensor(x, l_t_prev)
-            g_t_flat = torch.cat(
-                    [self.avgpool(g) for g in g_t], 1).squeeze()
-            h_t = self.rnn(g_t_flat)
-            
-            log_pi, l_t = self.locator(h_t)
-            h_t_flat = h_t.flatten(1,-1)
-            b_t = self.baseliner(h_t_flat).squeeze(0) 
-            y_p = self.classifier(h_t_flat)
-            l_t_prev = l_t
-            
-            # store tensors
-            locs.append(l_t)
-            baselines.append(b_t)
-            log_pis.append(log_pi)
-            log_probas.append(y_p)
-        
-        # convert list to tensors and reshape
-        baselines = torch.stack(baselines).transpose(1, 0)
-        log_pis = torch.stack(log_pis).transpose(1, 0)
-        log_probas = torch.stack(log_probas).transpose(1, 0)
-        
-        return log_probas, locs, log_pis, baselines
-    
+        return loss_classify, loss_reinforce, loss_baseline    
 
 #TODO refactor all code to make ACONVLSTM a clean drop-in modular replacement.
 #TODO figure out if the above TODO is even humanely possible
@@ -338,11 +336,11 @@ class CUBRAM_ACONVLSTM(nn.Module):
     
 
 class ff_r18(nn.Module):
-    def __init__(self, retina, pretrained=True):
+    def __init__(self, retina=None, pretrained=True):
         super(ff_r18, self).__init__()
         self.require_locs = True #assumes x consists of (image, locations)
         self.retina = retina
-        self.n_patches = retina.k
+        self.n_patches = retina.k if retina is not None else 1
         self.name = 'ff_r18'
         self.resnet18 = ResNet18_short()
         if pretrained: self.resnet18.load_state_dict(resnet18(pretrained=True).state_dict())
@@ -357,19 +355,26 @@ class ff_r18(nn.Module):
         for i, sample in enumerate(y_locs):
             locs = sample[torch.where(sample[:,2] == 1)]
             centroid = torch.mean(locs,0)[:2].int()
+            centroid = (centroid - 250)/250 #normalize
             l_t_prev[i] = centroid
         
-        #foveate, process patches individually
-        phi = self.retina.foveate(x[0], l_t_prev)
-        out = []
-        for i in range(self.n_patches):
-            x = phi[:,i,:,:,:] #select patch
+        #foveate, process patches individually, average features
+        if self.retina is not None:
+            phi = self.retina.foveate(x[0], l_t_prev)
+            out = []
+            for i in range(self.n_patches):
+                x = phi[:,i,:,:,:] #select patch
+                x = self.resnet18(x)
+                x = self.pool(x)
+                out.append(x)
+            #torch.mean might have gradient problems, use pool instead
+            x = self.pool(torch.cat(out, dim=-1))
+        else: 
+            x = x[0].cuda()
             x = self.resnet18(x)
             x = self.pool(x)
-            out.append(x)
-        
+            
         #average patches and predict
-        x = torch.mean(torch.stack(out), 0)
         x = F.relu(self.fc1(x.flatten(1)))
         pred = F.log_softmax(self.fc2(x), dim=1)
         pred = pred.unsqueeze(1) #timestep dimension

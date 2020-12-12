@@ -134,28 +134,10 @@ class Trainer(object):
                 if self.C.gpu:
                     y = y.cuda()
                 x, y = Variable(x), Variable(y) #TODO: deprecated, check version
-                if self.model.require_locs: x = (x, y_locs)
                 
                 # classify image
+                if self.model.require_locs: x = (x, y_locs)
                 log_probas, locs, log_pi, baselines = self.model(x)
-                
-#                # extract prediction
-#                prediction = torch.max(log_probas[-1], 1)[1].detach()
-#                
-#                # compute reward
-#                baselines = baselines.squeeze()
-#                R = (prediction == y).float()
-#                R = R.unsqueeze(1).repeat(1, self.model.timesteps)
-#                adjusted_R = R - baselines.detach()
-#
-#                # intermediate classification supervision
-#                Y = y.repeat(1, self.model.timesteps)
-#                loss_classify = F.nll_loss(log_probas, Y)
-#                
-#                loss_reinforce = torch.sum(-log_pi*adjusted_R, dim=1) #sum timesteps
-#                loss_reinforce = torch.mean(loss_reinforce, dim=0) #avg batch
-#                loss_baseline = F.mse_loss(baselines, R)
-#                total_loss = loss_classify + loss_reinforce + loss_baseline
                 
                 # compute losses, gradients and update
                 losses = self.model.loss(log_probas, log_pi, baselines, y)
