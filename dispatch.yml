@@ -10,16 +10,16 @@ RAM:
   foveal_size: 37     #size of high-res patch
   n_patches: 2
   scaling: 10    #scale of successive patches
-  std: 0.09           #location net gaussian policy standard deviation
+  std: 0.05           #location net gaussian policy standard deviation
 training:
   batch_size: 16
-  num_workers: 0
+  num_workers: 4
   shuffle: True
   epochs: 420
   init_lr: 5.0e-3
   es: True              #early stopping
   delta: 0.5
-  patience: 50
+  patience: 30
   resume: False
   best: True
   M: 1                #validation stochasticity var

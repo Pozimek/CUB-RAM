@@ -70,6 +70,7 @@ class CUBDataset(Dataset):
         self.transform = transform
         self.training = True
         self.num_classes = 200
+        self.collate_pad = True #whether to correct part locs for padding
         
         # Metadata
         images = pd.read_csv(join(self.root,'images.txt'), sep=' ', 
@@ -114,6 +115,14 @@ class CUBDataset(Dataset):
 
         if self.transform is not None:
             img = self.transform(img)
+            
+        #correct anatomical part locs for padding
+        if self.collate_pad:
+            parts[:,0] += (500-img.shape[-1])//2
+            parts[:,1] += (500-img.shape[-2])//2
+        
+        #Pytorch and rest of repo works in y,x order, so swap from x,y
+        parts[:,[0,1,2]] = parts[:,[1,0,2]]
 
         return img, label, parts
     

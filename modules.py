@@ -7,6 +7,7 @@ Modules used in CUB-RAM investigations.
 
 @author: piotr
 """
+#TODO: proper gpu checks, atm most code wouldn't run on cpu
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,12 +40,105 @@ model_urls = {
     'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
 }
 
-class retinocortical_sensor(object):
+class RAM_sensor(object):
+    """ 
+    A superclass for RAM sensor modules.
+    """
+    def __init__(self):
+        """Required variables"""
+        self.k = None #num of patches
+        self.width = None #assuming sensor width=height
+        self.out_shape = None
+        self.fixation = None
+        
+    def reset(self):
+        self.fixation = None
+    
+    def _foveate(self, x, coords, v=0):
+        """Sensor-specific sampling function, uses absolute coordinates.
+        
+        Args
+        ----
+        - x: batch of input images. (B, C, H, W)
+        - l: Normalized coordinates in the image range. (B, 2)
+        - v: visualisation level (0-2) to be stored in variable. 
+             0: None 
+             1: Input, (x,y) and foveation 
+             2: Input, (x,y), pre-processed and post-processed foveation
+        
+        Returns
+        -------
+        - phi: The foveated image glimpse. (B, k, C, g, g)"""
+        raise NotImplementedError
+        
+    def foveate_exo(self, x, l, v=0):
+        """Sample using exocentric coordinates"""
+        B, C, H, W = x.shape
+        T = torch.tensor([H,W]).float().cuda()
+        coords = self.to_exocentric(T, l)
+        self.fixation = coords
+        
+        return self._foveate(x, coords, v=v)
+        
+    def foveate_ego(self, x, l, v=0):
+        """Sample using egocentric coordinates"""
+        if self.fixation is None: #first fixation has to be exocentric
+            return self.foveate_exo(x, l, v=v)
+        B, C, H, W = x.shape
+        T = torch.tensor([H,W]).float().cuda()
+        coords = self.to_egocentric(T, l)
+        self.fixation = coords
+        
+        return self._foveate(x, coords, v=v)
+    
+    def to_egocentric(self, T, coords):
+        """
+        Convert coordinates from [-1,1] range to egocentric coordinates,
+        ie fixation + offset from fixation location.
+        """
+        #compute and add offset to current fixation
+        loc = self.fixation + (0.5*self.width*coords)
+        
+        #clip to image boundaries
+        torch.clamp_(loc[:,0], min=1, max=T[0])
+        torch.clamp_(loc[:,1], min=1, max=T[1])
+        
+        return loc.long()
+   
+    def to_exocentric(self, T, coords):
+        """
+        Convert coordinates in the range [-1, 1] to range [0, T] 
+        where T is the (H, W) size of the image.
+        """
+        return (0.5 * ((coords + 1.0) * T)).long()
+    
+    def to_egocentric_action(self, loc):
+        """
+        Convert egocentric coordinates, ie offset from fixation location,
+        to range [-1, 1] (normalized by sensor width).
+        """
+        action = 2 * (loc / self.width)
+        
+        #clip to [-1, 1]
+        torch.clamp_(action[:,0], min=-1, max=1)
+        torch.clamp_(action[:,1], min=-1, max=1)
+        
+        return action
+    
+    def to_exocentric_action(self, T, coords):
+        """
+        Convert exocentric coordinates in the range [0, T] to range [-1, 1]
+        where T is the (H, W) size of the image.
+        """
+        return ((coords / T) * 2.0 - 1.0)
+        
+class retinocortical_sensor(RAM_sensor):
     """
     First software retina wrapper, hardcoded 16k retina. Very inefficient in 
     batch processing, lots of typecasting, assumes gpu=True. Just horrible.
     """
     def __init__(self, gpu=True):
+        super(retinocortical_sensor, self).__init__()
         self.k = 1 #one "patch"
         self.sigma_base = 0.5
         self.mean_rf = 1
@@ -64,18 +158,16 @@ class retinocortical_sensor(object):
         self.R.loadCoeff(retpath.format(self.sigma_base, self.mean_rf, 'coeff'))
 #        if gpu: self.R._cudaRetina.set_samplingfields(self.R.loc, self.R.coeff) #prepare
         self.R.prepare((500,500), (250,250))
+        self.width = self.R.width
         
         self.C = Cortex(gpu=gpu)
         self.C.loadLocs(Llocpath, Rlocpath)
         self.C.loadCoeffs(Lcoeffpath, Rcoeffpath)
         
-    def foveate(self, x, l_t_prev):
+    def _foveate(self, x, coords, v=0):
+        #TODO: visualisation code
         phi = []
         B, C, H, W = x.shape
-
-        # denormalize coords of patch center
-        T = torch.tensor([H,W]).float().cuda()
-        coords = self.denormalize(T, l_t_prev)
         
         for i, sample in enumerate(x):
             fixation = (coords[i,0].item(), coords[i,1].item())
@@ -100,15 +192,8 @@ class retinocortical_sensor(object):
         phi = torch.cat(phi).unsqueeze(1).cuda()
         
         return phi
-    
-    def denormalize(self, T, coords):
-        """
-        Convert coordinates in the range [-1, 1] to range [0, T] 
-        where T is the (H, W) size of the image.
-        """
-        return (0.5 * ((coords + 1.0) * T)).long()
 
-class crude_retina(object):
+class crude_retina(RAM_sensor):
     """
     A retina that extracts a foveated glimpse phi around location l. 
     Phi consists of multi-resolution overlapping square image patches.
@@ -120,34 +205,19 @@ class crude_retina(object):
     - s: scaling factor that controls the size of successive patches.
     """
     def __init__(self, g, k, s, gpu):
+        super(crude_retina, self).__init__()
         self.g = g
         self.k = k
         self.s = s
+        self.width = g*(s**(k-1))
         self.gpu = gpu
         self.sigma = np.pi*s
         self.lowpass = False #TODO: fix sigma formula. Lowpass off until then
         self.gauss = None
-        self.coords = None
         self.vis_data = None #variable to store visualisation data
         self.out_shape = (3,g,g)
         
-    def foveate(self, x, l, v=0):
-        """
-        Extract k multi-res square patches of size g, centered at location l.
-
-        Args
-        ----
-        - x: batch of input images. (B, C, H, W)
-        - l: Normalized coordinates in the range [-1, 1]. (B, 2)
-        - v: visualisation level (0-2) to be stored in variable. 
-             0: None 
-             1: Input, (x,y) and foveation 
-             2: Input, (x,y), pre-processed and post-processed foveation
-        
-        Returns
-        -------
-        - phi: The foveated image glimpse. (B, k, C, g, g)
-        """
+    def _foveate(self, x, l, v=0):
         phi = []
         size = self.g
         if self.gauss is None: 
@@ -181,26 +251,23 @@ class crude_retina(object):
         
         # update visualisation variable
         if v == 1:
-            self.vis_data = x.clone(), self.coords, phi.clone()
+            self.vis_data = x.clone(), self.fixation, phi.clone()
         elif v == 2:
-            self.vis_data = x.clone(), self.coords, preblur, phi.clone()
+            self.vis_data = x.clone(), self.fixation, preblur, phi.clone()
         
         return phi
 
-    def extract_patch(self, x, l, size):
+    def extract_patch(self, x, coords, size):
         """
         Extract a single patch (B, C, size, size) for each image in 
-        the minibatch x (B, C, H, W) at specified locations l (B, 2).
+        the minibatch x (B, C, H, W) at specified locations coords (B, 2).
         """
         B, C, H, W = x.shape
-
-        # denormalize coords of patch center
         T = torch.tensor([H,W]).float().cuda()
-        self.coords = self.denormalize(T, l)
 
         # compute top left corner of patch
-        patch_x = self.coords[:, 1] - (size // 2)
-        patch_y = self.coords[:, 0] - (size // 2)
+        patch_x = coords[:, 1] - (size // 2)
+        patch_y = coords[:, 0] - (size // 2)
 
         # loop through mini-batch and extract
         patch = []
@@ -233,13 +300,6 @@ class crude_retina(object):
         patch = torch.cat(patch)
         return patch
 
-    def denormalize(self, T, coords):
-        """
-        Convert coordinates in the range [-1, 1] to range [0, T] 
-        where T is the (H, W) size of the image.
-        """
-        return (0.5 * ((coords + 1.0) * T)).long()
-
     def exceeds(self, from_x, to_x, from_y, to_y, T):
         """
         Check if the extracted patch fits within the image of size T.
@@ -249,23 +309,67 @@ class crude_retina(object):
         return False
 
 class ResNet18_short(ResNet):
-    #Resnet18 with ablated avgpool, flatten and fc
-    def __init__(self):
+    #Resnet18 with ablated avgpool, flatten, fc and a selected number of layers
+    def __init__(self, layers = 4, pretrained = True, cleanup=True, maxpool=True):
         super(ResNet18_short, self).__init__(BasicBlock, [2, 2, 2, 2])
+        self.num_layers = layers
+        self.remove_maxpool = not maxpool
+        
+        if pretrained:
+            self.load_state_dict(resnet18(pretrained=True).state_dict())
+            
+        if cleanup: self.cleanup()
+        if self.remove_maxpool: self.maxpool = nn.Identity()
+        
+    def cleanup(self):
+        #delete unused layers
+        for i in range(self.num_layers+1, 5):
+            setattr(self, "layer{}".format(i), None)
+        
+        #correct maxpool?
+        if self.remove_maxpool: self.maxpool = nn.Identity()
+            
+    def load_weights(self, weights):
+        # First load weights, then delete unused layers
+        self.__init__(layers=self.num_layers, cleanup=False, 
+                      maxpool= not self.remove_maxpool)
+        self.load_state_dict(weights)
+        self.cleanup()
         
     def forward(self, x):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
-    
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x) 
+        
+        for i in range(1, self.num_layers+1):
+            x = getattr(self, "layer{}".format(i))(x)
         
         return x
+
+class glimpse_module(nn.Module):
+    def __init__(self, retina, feature_extractor):
+        super(glimpse_module, self).__init__()
+        self.retina = retina
+        self.feature_extractor = feature_extractor
+        
+        self.out_shape = out_shape(self.feature_extractor, retina.out_shape)
+        self.n_patches = retina.k if type(retina) is crude_retina else 1
+        
+    def forward(self, x, l_t_prev):
+        phi = self.retina.foveate_ego(x, l_t_prev)
+        
+        #split up phi into patches, process individually
+        out = []
+        for i in range(self.n_patches):
+            x = phi[:,i,:,:,:] #select patch
+            out.append(self.feature_extractor(x))
+
+        return out #n_patches of g_t's, each g_t has shape of self.out_shape
     
+    def reset(self):
+        self.retina.reset()
+
 class sensor_resnet18(nn.Module):
     def __init__(self, retina, pretrained=True):
         super(sensor_resnet18, self).__init__()
@@ -275,11 +379,12 @@ class sensor_resnet18(nn.Module):
         if pretrained:
             self.resnet18.load_state_dict(resnet18(pretrained=True).state_dict())
         
-        self.out_shape = out_shape(self.resnet18, self.retina.out_shape)
+        self.out_shape = out_shape(self.resnet18, retina.out_shape)
         self.n_patches = retina.k if type(retina) is crude_retina else 1
         
     def forward(self, x, l_t_prev):
-        phi = self.retina.foveate(x, l_t_prev)
+        phi = self.retina.foveate_ego(x, l_t_prev)
+        #phi = self.retina.foveate_exo(x, l_t_prev)
         
         #split up phi into patches, process individually
         out = []
@@ -289,8 +394,12 @@ class sensor_resnet18(nn.Module):
 
         return out #n_patches of g_t's, each g_t has shape of self.out_shape
     
+    def reset(self):
+        self.retina.reset()
+    
 class glimpse_network(nn.Module):
     """
+    Unused code.
     Args
     ----
     - x: a 4D Tensor of shape (B, C, H, W). The minibatch of images.
@@ -587,6 +696,34 @@ class FC_RNN(nn.Module):
         
         return h_t
 
+#TODO: RAM_memory(nn.Module) superclass for CONVlstm, ACONVlstm, RC_RNN and lstm
+#TODO: refactor lstm class to support multiple cells just like CONVlstm
+
+class lstm(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(lstm, self).__init__()
+        self.core = nn.LSTM(input_size, hidden_size)
+        self.hidden_size = hidden_size
+        self.hidden_state = None
+        self.cell_state = None
+    
+    def reset(self):
+        self.hidden_state = None
+        self.cell_state = None
+    
+    def forward(self, x):
+        x = x.unsqueeze(0) #add sequence_len dimension
+        
+        if self.hidden_state is None:
+            _, chcc = self.core(x)
+        else:
+            _, chcc = self.core(x, (self.hidden_state, self.cell_state))
+            
+        self.hidden_state = chcc[0]
+        self.cell_state = chcc[1]
+        
+        return chcc[0].squeeze(0)
+
 class location_network(nn.Module):
     """
     Uses the internal state h_t of the recurrent net to produce the location 
@@ -624,11 +761,12 @@ class location_network(nn.Module):
         mu = F.relu(self.fc1(x.flatten(1,-1).detach())) 
         mu = torch.tanh(self.fc2(mu))
 
-        # reparametrization trick (?)
+        # reparametrization trick
         noise = torch.zeros_like(mu)
         noise.data.normal_(std=self.std)
         l_t = mu + noise
         
+        # Log of probability density at l_t. Maximized using REINFORCE.
         # we assume both dimensions are independent
         # 1. pdf of the joint is the product of the pdfs
         # 2. log of the product is the sum of the logs
@@ -636,7 +774,7 @@ class location_network(nn.Module):
         log_pi = torch.sum(log_pi, dim=1)
         
         # bound between [-1, 1]
-        l_t = torch.tanh(l_t)
+        l_t = torch.clamp(l_t, -1, 1)
 
         return log_pi, l_t
 

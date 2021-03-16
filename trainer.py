@@ -140,7 +140,8 @@ class Trainer(object):
                 log_probas, locs, log_pi, baselines = self.model(x)
                 
                 # compute losses, gradients and update
-                losses = self.model.loss(log_probas, log_pi, baselines, y)
+                losses = self.model.loss(log_probas, log_pi, baselines, y, 
+                                         locs, y_locs)
                 total_loss = sum(losses) if type(losses) is tuple else losses
                 total_loss.backward()
                 self.optimizer.step()
@@ -159,13 +160,13 @@ class Trainer(object):
                 # log to tensorboard
                 if self.C.tensorboard:
                     iteration = epoch * len(self.data_loader) + i
-                    self.writer.add_scalar('Loss (Detailed)/Training', 
-                                           loss_t.avg, iteration)
-                    self.writer.add_scalar('Accuracy (Detailed)/Training',
-                                           accs.avg, iteration)
+                    self.writer.add_scalars('Loss (Detailed)/Training', {
+                        "Train_loss":loss_t.avg}, iteration)
+                    self.writer.add_scalars('Accuracy (Detailed)/Training', {
+                        "Train_acc":accs.avg}, iteration)
                     self.writer.add_scalars('Partial Losses/Training',{
-                            "Action_Loss" : loss_act.avg,
-                            "Base_Loss" : loss_base.avg}, iteration) 
+                            "Action_Loss_train" : loss_act.avg,
+                            "Base_Loss_train" : loss_base.avg}, iteration) 
                 
                 # update status bar
                 toc = time.time()
@@ -200,7 +201,7 @@ class Trainer(object):
                     # classify batch
                     log_probas, locs, log_pi, baselines = self.model(x)
                     
-                    losses = self.model.loss(log_probas, log_pi, baselines, y)
+                    losses = self.model.loss(log_probas, log_pi, baselines, y, locs, y_locs)
                     total_loss = sum(losses) if type(losses) is tuple else losses
                     
                     # compute accuracy
@@ -218,13 +219,13 @@ class Trainer(object):
                 # log to tensorboard
                 if self.C.tensorboard:
                     iteration = epoch * len(self.data_loader) + i
-                    self.writer.add_scalar('Loss (Detailed)/Training', 
-                                           loss_t.avg, iteration)
-                    self.writer.add_scalar('Accuracy (Detailed)/Training',
-                                           accs.avg, iteration)
+                    self.writer.add_scalars('Loss (Detailed)/Training', {
+                        "Val_loss":loss_t.avg}, iteration)
+                    self.writer.add_scalars('Accuracy (Detailed)/Training', {
+                        "Val_acc":accs.avg}, iteration)
                     self.writer.add_scalars('Partial Losses/Training',{
-                            "Action_Loss" : loss_act.avg,
-                            "Base_Loss" : loss_base.avg}, iteration)
+                            "Action_Loss_val" : loss_act.avg,
+                            "Base_Loss_val" : loss_base.avg}, iteration) 
         
         print("Val epoch {} - avg acc: {:.2f} | avg loss: {:.3f}".format(
                 epoch, accs.avg, loss_t.avg))

@@ -66,7 +66,7 @@ def memshow():
  
     
 #pyplot visualisation
-def showArray(array, size=(8,8), cmap = None):    
+def showArray(array, size=(8,8), cmap = None):
     plt.figure(figsize=size)
     plt.axis('off')
     plt.imshow(array, interpolation='none', cmap=cmap)

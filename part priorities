@@ -1,0 +1,8 @@
+Selecting a 'canonical' order for part fixations. Have to account for occlusion.
+IDs per dataset, offset by +1 from array.
+
+<general head> left/right eye, forehead, crown, throat, nape: 7, 11, 6, 5, 15, 10, 2, 4, 3, 1, 9, 13, 8, 12, 14
+<general legs> legs, belly: 8, 12, 3, 4, 15, 9, 13, 1, 10, 5, 6, 7, 11, 14, 2 
+<general torso front> breast, belly, throat: 4, 3, 15, 8, 12, 1, 2,6,7,11,5,10, 13, 9, 14
+<general front face> beak, throat, forehead: 2, 15, 6, 11, 7, 5, 10, 4, 3, 1, 8, 12,9, 13, 14
+<general long feathers/'jacket'> tail, wings, back: 14, 9, 13, 1, 10, 5, 15, 3,4,6, 2, 12, 8, 11, 7
