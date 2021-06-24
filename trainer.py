@@ -16,11 +16,13 @@ from tqdm import tqdm
 from utils import AverageMeter
 
 import torch
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from torch.autograd import Variable
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim import lr_scheduler
+from adabelief_pytorch import AdaBelief
 
 class Trainer(object):
     def __init__(self, C, data_loader, model):
@@ -47,11 +49,13 @@ class Trainer(object):
         self.es_acc = 0.
         self.counter = 0
         self.lr = C.training.init_lr
-        self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9)
+        self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=5e-3)
+#        self.optimizer = optim.AdamW(params, lr=5e-6, weight_decay = 1)
         self.lr_scheduler = lr_scheduler.StepLR(self.optimizer, 
                                                 step_size=10, gamma=0.5)
-        #TODO scheduler hyperparams to config file
         
+        #TODO scheduler hyperparams to config file?
+        self.gamma = 1
         
         # set up logging
         if C.tensorboard:
@@ -71,6 +75,7 @@ class Trainer(object):
         
         print("\n[*] Train on {} images, validate on {} images".format(
                 self.num_train, self.num_valid))
+        print("Glimpse module output shape: ", self.model.glimpse_module.out_shape)
         for epoch in range(self.start_epoch, self.C.training.epochs):
             print('\nEpoch: {}/{} - LR: {:.6f}'.format(
                     epoch+1, self.C.training.epochs, 
@@ -88,7 +93,6 @@ class Trainer(object):
                 self.writer.add_scalars("Smoothed Results/Losses", {
                         "Train_loss":train_loss,
                         "Valid_loss":valid_loss}, epoch)
-                
                 self.writer.add_scalars("Smoothed Results/Accuracies", {
                         "Train_accuracy":train_acc,
                         "Valid_accuracy":valid_acc}, epoch)
@@ -106,8 +110,11 @@ class Trainer(object):
             
             # Early stopping
             ES_best = valid_acc > (self.es_acc + self.C.training.delta)
-            self.es_acc = max(valid_acc + self.C.training.delta, self.es_acc)
-            self.counter = self.counter + 1 if not ES_best else 0
+            if ES_best: 
+                self.es_acc = valid_acc
+                self.counter = 0
+            else: self.counter += 1
+            
             if self.C.training.es and (self.counter > self.C.training.patience):
                 print("[!] No improvement in a while, early stopping.")
                 break
@@ -116,16 +123,23 @@ class Trainer(object):
                 self.best_valid_acc))
         self.writer.close()
         
+        return self.best_valid_acc
+        
     def train_one_epoch(self, epoch):
         self.model.train()
         self.data_loader.dataset.train()
         
+        # Averages for logs
         loss_t = AverageMeter()
         accs = AverageMeter()
         loss_act = AverageMeter() 
         loss_base = AverageMeter()
         
         tic = time.time()
+        
+        # Loss function modules for p-module.
+        cos = nn.CosineSimilarity(dim=2)
+        mae = nn.L1Loss(reduction='none')
         
         #loader: img, label, parts
         with tqdm(total=self.num_train) as pbar:
@@ -142,6 +156,20 @@ class Trainer(object):
                 # compute losses, gradients and update
                 losses = self.model.loss(log_probas, log_pi, baselines, y, 
                                          locs, y_locs)
+                
+                # predictive module loss
+#                loss_cos = 1 - cos(self.model.h[:,1:,:], self.model.ph[:,:-1,:])
+#                loss_mae = torch.mean(mae(self.model.ph[:,:-1,:], self.model.h[:,1:,:]), dim=2)
+                
+                # APC loss
+#                loss_cos = 1 - cos(self.model.g[:,1:,:], self.model.pg[:,:-1,:])
+#                loss_mae = torch.mean(mae(self.model.pg[:,:-1,:], self.model.g[:,1:,:]), dim=2)
+#                total_APCloss = torch.mean(torch.sum(loss_mae, dim=1))
+#                losses = losses + (self.gamma * total_APCloss,)
+                
+                # sum across timesteps, avg across batch
+#                total_lookahead = torch.mean(torch.sum(loss_mae, dim=1))
+#                losses = losses + (self.gamma * total_lookahead,)
                 total_loss = sum(losses) if type(losses) is tuple else losses
                 total_loss.backward()
                 self.optimizer.step()
@@ -166,7 +194,27 @@ class Trainer(object):
                         "Train_acc":accs.avg}, iteration)
                     self.writer.add_scalars('Partial Losses/Training',{
                             "Action_Loss_train" : loss_act.avg,
-                            "Base_Loss_train" : loss_base.avg}, iteration) 
+                            "Base_Loss_train" : loss_base.avg}, iteration)
+                    
+#                    #log MAE, cosine dist and mse
+#                    MAE = torch.mean(loss_mae, dim=0)
+#                    COS = torch.mean(loss_cos, dim=0)
+#                    D = {"Total":total_APCloss}
+#                    for i in range(len(MAE)):
+#                        D["mae-T{}".format(i)] = MAE[i].item()
+#                        D["cos-T{}".format(i)] = COS[i].item()
+#                    self.writer.add_scalars('APC Loss/Training', 
+#                                            D, iteration)
+#                    
+#                    #log mean absolute activation for select p-module output
+#                    MAAp = torch.mean(torch.abs(self.model.pg[:,:-1,:]), dim=(0,2))
+#                    MAA = torch.mean(torch.abs(self.model.g[:,:-1,:]), dim=(0,2))
+#                    D = {}
+#                    for i in range(len(MAAp)):
+#                        D["MAAp-T{}".format(i)] = MAAp[i].item()
+#                        D["MAA-T{}".format(i)] = MAA[i].item()
+#                    self.writer.add_scalars('APC MAA/Training',
+#                                            D, iteration)
                 
                 # update status bar
                 toc = time.time()
@@ -183,10 +231,15 @@ class Trainer(object):
         self.model.eval()
         self.data_loader.dataset.test()
         
+        # Averages for logs
         loss_t = AverageMeter()
         accs = AverageMeter()
         loss_act = AverageMeter()
         loss_base = AverageMeter()
+        
+        # Distance functions and loss modules for p-modules.
+        cos = nn.CosineSimilarity(dim=2)
+        mae = nn.L1Loss(reduction='none')
         
         for i, (x, y, y_locs) in enumerate(self.data_loader):
             with torch.no_grad():
@@ -202,6 +255,19 @@ class Trainer(object):
                     log_probas, locs, log_pi, baselines = self.model(x)
                     
                     losses = self.model.loss(log_probas, log_pi, baselines, y, locs, y_locs)
+#                    
+#                    loss_cos = 1 - cos(self.model.h[:,1:,:], self.model.ph[:,:-1,:])
+#                    loss_mae = torch.mean(mae(self.model.ph[:,:-1,:], self.model.h[:,1:,:]), dim=2)
+                    
+#                    # APC loss
+#                    loss_cos = 1 - cos(self.model.g[:,1:,:], self.model.pg[:,:-1,:])
+#                    loss_mae = torch.mean(mae(self.model.pg[:,:-1,:], self.model.g[:,1:,:]), dim=2)
+#                    total_APCloss = torch.mean(torch.sum(loss_mae, dim=1))
+#                    losses = losses + (self.gamma * total_APCloss,)
+                    
+#                    #sum across timesteps, avg across batch
+#                    total_lookahead = torch.mean(torch.sum(loss_mae, dim=1))
+#                    losses = losses + (self.gamma * total_lookahead,)
                     total_loss = sum(losses) if type(losses) is tuple else losses
                     
                     # compute accuracy
@@ -226,7 +292,27 @@ class Trainer(object):
                     self.writer.add_scalars('Partial Losses/Training',{
                             "Action_Loss_val" : loss_act.avg,
                             "Base_Loss_val" : loss_base.avg}, iteration) 
-        
+    
+#                    #log MAE, cosine dist and mse
+#                    MAE = torch.mean(loss_mae, dim=0)
+#                    COS = torch.mean(loss_cos, dim=0)
+#                    D = {"Total":total_APCloss}
+#                    for i in range(len(MAE)):
+#                        D["mae-T{}val".format(i)] = MAE[i].item()
+#                        D["cos-T{}val".format(i)] = COS[i].item()
+#                    self.writer.add_scalars('APC Loss/Training', 
+#                                            D, iteration)
+#                    
+#                    #log mean absolute activation for select p-module output
+#                    MAAp = torch.mean(torch.abs(self.model.pg[:,:-1,:]), dim=(0,2))
+#                    MAA = torch.mean(torch.abs(self.model.g[:,:-1,:]), dim=(0,2))
+#                    D = {}
+#                    for i in range(len(MAAp)):
+#                        D["MAAp-T{}val".format(i)] = MAAp[i].item()
+#                        D["MAA-T{}val".format(i)] = MAA[i].item()
+#                    self.writer.add_scalars('APC MAA/Training',
+#                                            D, iteration)
+                    
         print("Val epoch {} - avg acc: {:.2f} | avg loss: {:.3f}".format(
                 epoch, accs.avg, loss_t.avg))
         return loss_t.avg, accs.avg

@@ -107,7 +107,7 @@ def out_shape(module, in_shape):
     Skips batch dimension.
     """
     device = next(module.parameters()).device
-    T = torch.zeros(in_shape).unsqueeze(0).to(device)
+    T = torch.zeros((2,)+in_shape).to(device)
     with torch.no_grad():
         O = module(T)
     return O.shape[1:]
