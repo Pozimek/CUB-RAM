@@ -20,17 +20,137 @@ from torchvision.transforms import Compose, ToTensor, Normalize
 from torch.utils.data.sampler import RandomSampler
 from torch.autograd import Variable
 from random import randint
+import torch.nn.functional as F
+
 
 from CUB_loader import CUBDataset, collate_pad
 import matplotlib.patches as patches
 from utils import showArray, get_ymlconfig, AverageMeter
 from modules import RAM_sensor, crude_retina, ResNet18_module, lstm_, laRNN
 from model import Guide, WW_RAM, RAM_baseline, FF_GlimpseModel
+from trainer import Trainer
 
 def main(config):
-    val(config)
+    predictive_mem_test(config)
+#    val(config)
 #    features(config)
 #    vis(config)
+
+def predictive_mem_test(config):
+    """Hypothesis: foveal memory moves in a specific direction determined by the
+    class observed and the peripheral predictive stream guesses that direction
+    from peripheral data.
+    
+    Tests the cosine distance between:
+        - successive foveal memory state deltas
+        - final memory states at different samples of the same output class (how?)
+    """
+    # Seeds, transform and config
+    config.tensorboard = False
+#    torch.manual_seed(config.seed)
+#    np.random.seed(config.seed)
+#    os.environ['PYTHONHASHSEED'] = str(config.seed)
+    kwargs = {}
+    if config.gpu: 
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+#        torch.cuda.manual_seed(config.seed)
+        kwargs = {'num_workers': config.training.num_workers, 
+                  'pin_memory': True}
+    transform = Compose([ToTensor(), 
+                             Normalize(mean=[0.485, 0.456, 0.406], 
+                                       std=[0.229, 0.224, 0.225])])
+    dataset = CUBDataset(transform = transform)
+    retina = crude_retina(config.RAM.foveal_size, config.RAM.n_patches, 
+                              config.RAM.scaling, config.gpu, clamp=False)
+    
+    modelstrings = ["retina-WWRAMfix-imaginationv26-{}"]
+    fixation_sets = ["MHL3"]
+    
+    for model_T in [3]:
+        for M in modelstrings:
+            config.name = M.format(model_T)
+            print(" ")
+            print("Validating ", config.name, "...")
+            feature_extractor = ResNet18_module(blocks=4, maxpool=False, stride=True)
+            
+            for fixation_set in fixation_sets:
+                print("         ... with fixation set", fixation_set)
+                model = WW_RAM(config.name, config.RAM.std, retina, feature_extractor, 
+                            config.gpu, fixation_set = fixation_set)
+                model.set_timesteps(model_T)
+                filename = config.name + '_best.pth.tar'
+                ckpt_path = os.path.join(config.ckpt_dir, filename)
+                ckpt = torch.load(ckpt_path) 
+                model.load_state_dict(ckpt['model_state'])
+                
+                data_loader = torch.utils.data.DataLoader(
+                    dataset, batch_size=config.training.batch_size, 
+                    sampler=RandomSampler(dataset), collate_fn = collate_pad,
+                    num_workers=config.training.num_workers, 
+                    pin_memory=kwargs['pin_memory'],)
+                
+                ## Data loop
+#                batch_size = config.training.batch_size
+                model.eval()
+                if config.gpu: model.cuda()
+                data_loader.dataset.test()
+                cos = nn.CosineSimilarity(dim=2)
+                
+                for i, (x, y, y_locs) in enumerate(data_loader):
+                    with torch.no_grad():
+                        if config.gpu:
+                            y = y.cuda()
+                        x, y = Variable(x), Variable(y)
+                        if model.require_locs: x = (x, y_locs)
+                        
+                        # classify batch
+                        log_probas, locs, log_pi, baselines = model(x)
+                        
+                        # compute cosine distances
+                        fov_h_deltas = model.fov_h[:,1:,...].flatten(2) - model.fov_h[:,:-1,...].flatten(2)
+#                        fov_ph_deltas = model.fov_h[:,1:,...].flatten(2) - model.fov_ph[:,:-1,...].flatten(2) #XXX HERE WAS A BUG
+                        fov_ph_deltas = model.fov_ph[:,:-1,...].flatten(2) - model.fov_h[:,:-1,...].flatten(2) #here it is fixed
+                        
+                        imaginary_cos = 1 - cos(fov_h_deltas, fov_ph_deltas)
+                        print("i_cos:", imaginary_cos.mean())
+                        
+                        successive_delta_cos = 1 - cos(fov_h_deltas[:,1:,...], fov_h_deltas[:,:-1,...])
+                        print("sd_cos:", successive_delta_cos.mean())
+                        
+                        successive_cos = 1 - cos(model.fov_h[:,1:,...].flatten(2), model.fov_h[:,:-1,...].flatten(2))
+                        print("s_cos:", successive_cos.mean())
+                        
+                        sid_cos = 1 - cos(fov_ph_deltas[:,1:,...], fov_ph_deltas[:,:-1,...])
+                        print("sid_cos:", sid_cos.mean())
+                        
+                        sph_cos = 1 - cos(model.fov_ph[:,1:,...].flatten(2), model.fov_ph[:,:-1,...].flatten(2))
+                        print("sph_cos:", sph_cos.mean())
+                        
+                        spout_cos = 1 - cos(model.p_out[:,1:,...].flatten(2), model.p_out[:,:-1,...].flatten(2))
+                        print("spout_cos:", spout_cos.mean())
+                        
+                        sWWfov_cos = 1 - cos(model.WWfov[:,1:,...].flatten(2), model.WWfov[:,:-1,...].flatten(2))
+                        print("sWWfov_cos:", sWWfov_cos.mean())
+                        
+#                        p_target = model.WWfov[:,1:,...]
+                        p_target = model.L3[:,1:,...]
+                        loss_cos = 1 - cos(p_target.flatten(2), model.p_out[:,:-1,...].flatten(2))
+                        print("loss_cos:", loss_cos.mean())
+                        
+                        short_cos = 1 - cos(p_target[:,:,:,0], model.p_out[:,:-1,:,0])
+                        print("short_cos:", short_cos.mean())
+                        
+                        FE_cos = 1 - cos(model.WWfov[:,1:,...].flatten(2), model.WWfov[:,:-1,...].flatten(2))
+                        print("FE_cos:", FE_cos.mean())
+                        
+                        FE_short_cos = 1 - cos(model.WWfov[:,1:,:,0], model.WWfov[:,:-1,:,0])
+                        print("FE_short_cos:", FE_short_cos.mean())
+                        
+#                        short_i_cos = 1 - cos(fov_h_deltas[:,:,:,0], fov_ph_deltas[:,:,:,0])
+#                        print("short_i_cos:", torch.mean(torch.sum(short_i_cos, dim=1)))
+                        print(" ")
+                        if i == 4: return                        
 
 def features(config):
     """Compare feature maps across time using cosine similarity and MAE"""
@@ -173,14 +293,14 @@ def val(config):
     dataset = CUBDataset(transform = transform)
     retina = crude_retina(config.RAM.foveal_size, config.RAM.n_patches, 
                               config.RAM.scaling, config.gpu, clamp=False)
-    memory = lstm_
+#    memory = lstm_
     
 #    model_T = 4
-    modelstrings = ["retina-RAMfix-fovperclampcanonical-{}"]
-    fixation_sets = ["MHL5", [4,0,0,0,0]]
+    modelstrings = ["retina-WWRAMfix-la2streamv18-{}"]
+    fixation_sets = ["MHL3"]
     
 #    for model_T in range(1,6):
-    for model_T in [1,2,3,4,5]:
+    for model_T in [3]:
         for M in modelstrings:
             config.name = M.format(model_T)
             print(" ")
@@ -189,11 +309,11 @@ def val(config):
             
             for fixation_set in fixation_sets:
                 print("         ... with fixation set", fixation_set)
-#                model = WW_RAM(config.name, config.RAM.std, retina, feature_extractor, 
-#                            config.gpu, fixation_set = fixation_set)
-                model = RAM_baseline(config.name, config.RAM.std, retina, 
-                                     feature_extractor, memory, 0, config.gpu, 
-                                     fixation_set = fixation_set)
+                model = WW_RAM(config.name, config.RAM.std, retina, feature_extractor, 
+                            config.gpu, fixation_set = fixation_set)
+#                model = RAM_baseline(config.name, config.RAM.std, retina, 
+#                                     feature_extractor, memory, 0, config.gpu, 
+#                                     fixation_set = fixation_set)
                 model.set_timesteps(model_T)
                 filename = config.name + '_best.pth.tar'
                 ckpt_path = os.path.join(config.ckpt_dir, filename)
@@ -206,8 +326,10 @@ def val(config):
                     num_workers=config.training.num_workers, 
                     pin_memory=kwargs['pin_memory'],)
                 
-                tester = Tester(config, loader, model)
-                tester.validate(1)
+#                tester = Tester(config, loader, model)
+#                tester.validate(1)
+                trainer = Trainer(config, loader, model)
+                trainer.validate(1)
 
 class Tester(object):
     def __init__(self, C, data_loader, model):

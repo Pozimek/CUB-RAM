@@ -26,7 +26,8 @@ from kornia import translate
 from bnlstm import LSTM, LSTMCell, BNLSTMCell, SeparatedBatchNorm1d
 
 import numpy as np
-from utils import gausskernel, conv_outshape, out_shape, ir
+from utils import gausskernel, conv_outshape, out_shape, ir, module_copy, spatialbasis
+from copy import deepcopy
 
 from retinavision.retina import Retina
 from retinavision.cortex import Cortex
@@ -225,10 +226,11 @@ class crude_retina(RAM_sensor):
         self.vis_data = None #variable to store visualisation data
         self.out_shape = (3,g,g)
         self.egocentric_clamp = clamp #XXX set clamp to True for unguided RAMs
+        self.downsampling_mode = 'nearest'
         
-    def _foveate(self, x, l, v=0):
+    def _foveate(self, x, l, v=0, size = None):
         phi = []
-        size = self.g
+        if size is None: size = self.g
         if self.gauss is None: 
             self.gauss = gausskernel(self.sigma, x.shape[1]).cuda()
             
@@ -246,12 +248,13 @@ class crude_retina(RAM_sensor):
                 preblur.append(phi[i].clone())
         
         # resize the patches to squares of size g
-        for i in range(1, len(phi)):
+        for i in range(0, len(phi)):
 #            k = phi[i].shape[-1] // self.g
             #lowpass filter
 #            if self.lowpass: phi[i] = F.conv2d(phi[i], self.gauss, 
 #               padding=self.gauss.shape[-1]//2, groups=x.shape[1]) 
-            phi[i] = F.interpolate(phi[i], self.g)
+            if phi[i].shape[-1] != self.g: 
+                phi[i] = F.interpolate(phi[i], self.g, mode=self.downsampling_mode)
 
         # add an empty glimpse dimension (k), concatenate along it
         for i in range(len(phi)):
@@ -382,36 +385,52 @@ class DenseNet_module(DenseNet):
         return out
 
 class ResNet18_module(ResNet):
-    #Resnet18 wrapper with ablated avgpool, flatten, fc and a selected number of layers
-    def __init__(self, blocks = 4, pretrained = True, cleanup = True, maxpool = True, stride=True):
+    #Resnet18 wrapper with lots of tinkering
+    def __init__(self, blocks = 4, pretrained = True, cleanup = True, 
+                 maxpool = True, stride=True, in_channels = 3):
         super(ResNet18_module, self).__init__(BasicBlock, [2, 2, 2, 2])
         self.num_blocks = blocks
         self.remove_maxpool = not maxpool
         self.stride = stride
+        self.in_channels = in_channels
         
         if pretrained:
             self.load_state_dict(resnet18(pretrained=True).state_dict())
-            
+        
         if cleanup: self.cleanup()
         if self.remove_maxpool: self.maxpool = nn.Identity()
+        self.imaginary_i = 4
+        self.layer_logs = [0]*(blocks+1)
         
+    
     def cleanup(self):
         #delete unused layers
+        del(self._modules['fc']) #XXX confirm this removes all refs to fc
         for i in range(self.num_blocks+1, 5):
             setattr(self, "layer{}".format(i), None)
         
         #correct maxpool?
         if self.remove_maxpool: self.maxpool = nn.Identity()
         
-        #reduce most strides to 1 (except 2nd block)
+        #reduce selected strides to 1
         if not self.stride:
-            self.conv1.stride = (1,1)
+#            self.conv1.stride = (1,1)
 #            self.layer2[0].conv1.stride = (1,1)
 #            self.layer2[0].downsample[0].stride = (1,1)
-            self.layer3[0].conv1.stride = (1,1)
-            self.layer3[0].downsample[0].stride = (1,1)
+#            self.layer3[0].conv1.stride = (1,1)
+#            self.layer3[0].downsample[0].stride = (1,1)
             self.layer4[0].conv1.stride = (1,1)
             self.layer4[0].downsample[0].stride = (1,1)
+        
+        #spatial basis channel expansion and weight copying
+        if self.in_channels != 3:
+            weight = self.conv1.weight.clone()
+            self.conv1 = nn.Conv2d(self.in_channels, self.conv1.out_channels, 
+                                   kernel_size=self.conv1.kernel_size, 
+                                   stride=self.conv1.stride, padding=self.conv1.padding,
+                                   bias=False)
+            with torch.no_grad():
+                self.conv1.weight[:, :3] = weight
             
     def load_weights(self, weights):
         # First load weights, then delete unused layers
@@ -420,7 +439,9 @@ class ResNet18_module(ResNet):
         self.load_state_dict(weights)
         self.cleanup()
         
-    def forward(self, x):
+    def forward(self, x, imaginary=False):
+        if imaginary: return self.im_forward(x)
+        
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -428,7 +449,13 @@ class ResNet18_module(ResNet):
         
         for i in range(1, self.num_blocks+1):
             x = getattr(self, "layer{}".format(i))(x)
+            self.layer_logs[i] = x.detach()
         
+        return x
+    
+    def im_forward(self, x):
+        for i in range(self.imaginary_i, self.num_blocks+1):
+            x = getattr(self, "layer{}".format(i))(x)
         return x
 
 #class ResConvLSTM(ResNet):
@@ -468,11 +495,13 @@ class ResNet18_module(ResNet):
 #        return x
 
 class glimpse_module(nn.Module):
-    def __init__(self, retina, feature_extractor, avgpool = False):
+    def __init__(self, retina, feature_extractor, avgpool = False, spatial = False, BN = True):
         super(glimpse_module, self).__init__()
+        self.spatial = spatial
         self.retina = retina
         self.feature_extractor = feature_extractor
         self.n_patches = retina.k if type(retina) is crude_retina else 1
+        self.disable_BN = not BN
         
         self.avgpool = nn.AdaptiveAvgPool2d((1,1)) if avgpool else False
         if avgpool: 
@@ -480,29 +509,91 @@ class glimpse_module(nn.Module):
                     self.feature_extractor, self.avgpool), retina.out_shape)
         else:
             self.out_shape = out_shape(self.feature_extractor, retina.out_shape)
-#        self.PE = PositionalEmbeddingNet(retina.out_shape[1:])
+            
+        if self.spatial:
+#            self.retina.out_shape = (67, self.retina.g, self.retina.g)
+            self.spatial_retina = deepcopy(retina) #not sure about this
+            self.spatial_retina.g = self.out_shape[-1] # for FE appending
+#            self.spatial_retina.downsampling_mode = 'area'
+            self.sbasis = spatialbasis(1000, 1000, 4, 4).unsqueeze(0)
+            self.out_shape = (self.out_shape[0]+64, self.out_shape[1], self.out_shape[2])
         
-    def forward(self, x, l_t_prev):
-        phi = self.retina.foveate_ego(x, l_t_prev)
+        # Use separate BN modules for each patch. Might break blocks param
+        self.BNs = [[] for i in range(self.n_patches)] #temp storage for BN layers
+        self.BN_ready = False
+        self.set_patch(0)
+        self.BN_ready = True
+        
+    def set_patch(self, patch, j=0, moddict=None):
+        """Replaces current BN layers inside feature extractor with patch 
+        appropriate BNs, ie different BN for fovea and periphery. 
+        Might be invariant to feature extractor used, might break 'blocks'
+        functionality of the FE wrappers. Voodoo
+        Also disables BN depending on the flag."""
+        if moddict is None: moddict = self.feature_extractor._modules
+        index = j
+        for i, key in enumerate(moddict.keys()):
+            if type(moddict[key]) is nn.BatchNorm2d:
+                if self.disable_BN: moddict[key] = nn.Identity()
+                if not self.BN_ready:
+                    for P in range(self.n_patches):
+                        self.BNs[P].append(deepcopy(moddict[key]))
+                moddict[key] = self.BNs[patch][index]
+                index += 1
+            elif len(moddict[key]._modules) > 0:
+                index = self.set_patch(patch, index, moddict[key]._modules)
+        
+        #register inactive BN modules
+        if moddict is self.feature_extractor._modules:
+            inactive = []
+            for i in [j for j in range(self.n_patches) if j!=patch]:
+                inactive += self.BNs[i]
+            self.BNs_inactive = nn.ModuleList(inactive)
+        return index
+    
+    def forward(self, x, l_t_prev, pos_t, imaginary = False):
+        if self.spatial:
+            basis = self.sample_spatial(x, pos_t)
+
+        if imaginary:
+            features = self.im_forward(x)
+            if self.spatial: return torch.cat((features, basis[:,0,...]), dim=1)
+            return features
         
         #split up phi into patches, process individually
+        phi = self.retina.foveate_ego(x, l_t_prev)
         out = []
         for i in range(self.n_patches):
             x = phi[:,i,:,:,:] #select patch
             
-#            #add PE
-#            if self.PE.t == 0:
-#                x = x + self.PE(torch.zeros_like(l_t_prev).cuda())
-#            else:
-#                x = x + self.PE(l_t_prev)
+            self.set_patch(i) # patch-specific BN inside FE
             features = self.feature_extractor(x)
+            if self.spatial: 
+                features = torch.cat((features, basis[:,i,...]), dim=1)
             if self.avgpool: features = self.avgpool(features)
             out.append(features)
         
         return out #n_patches of g_t's, each g_t has shape of self.out_shape
     
+    def sample_spatial(self, x, pos_t):
+        B, C, H, W = x.shape
+        T = torch.tensor([H,W]).float().cuda()
+        coords = self.spatial_retina.to_exocentric(T, pos_t)
+        self.spatial_retina.fixation = coords
+        basis = self.spatial_retina._foveate(self.sbasis, coords, size = self.retina.g).repeat(x.shape[0],1,1,1,1)
+        return basis
+    
     def reset(self):
         self.retina.reset()
+        
+    def im_forward(self, x):
+        self.set_patch(0)
+        features = self.feature_extractor(x, imaginary=True)
+        if self.avgpool: features = self.avgpool(features)
+        return features
+    
+    def get_layerlog(self, i):
+        return self.feature_extractor.layer_logs[i]
 
 class PositionalEmbeddingNet(nn.Module):
     def __init__(self, out_shape, hidden = [9, 9]):
@@ -557,16 +648,15 @@ class WW_module(nn.Module):
     def __init__(self, in_shape, out_channels, k):
         super(WW_module, self).__init__()
         self.spatial = in_shape[1:]
-        self.weights = nn.Parameter(
-                torch.FloatTensor(self.spatial+(out_channels,)))
-        torch.nn.init.xavier_uniform_(self.weights) #XXX decide on init
+        self.W = nn.Parameter(
+                torch.FloatTensor(torch.Size((1,1,)+self.spatial+(out_channels,))))
+        torch.nn.init.xavier_uniform_(self.W) #XXX decide on init
         
         self.out_shape = torch.Size((k*in_shape[0],out_channels))
     
     def forward(self, x):
-        x = x[..., None] * self.weights[None, None, ...]
-        x = x.sum(dim=(2,3))
-        return x #(B, 'what', 'where')
+        x = x[..., None] * self.W
+        return x.sum(dim=(2,3)) #(B, 'what', 'where')
 
 class WhatMix(nn.Module):
     def __init__(self, in_shape, out_shape, act=nn.Identity, bias=True):
@@ -608,6 +698,7 @@ class INFWhatMix(nn.Module):
         super(INFWhatMix, self).__init__()
         self.fc1 = nn.Linear(in_params, 32)
         self.fc2 = nn.Linear(32, in_shape[0]*out_channels)
+        self.biasfc = nn.Linear(in_params, out_channels) if bias else False
         self.out_channels = out_channels
         
         self.out_shape = torch.Size((out_channels, in_shape[1]))
@@ -615,6 +706,9 @@ class INFWhatMix(nn.Module):
         
     def forward(self, x, params):
         B, in_channels, in_where = x.shape #16, 1024, 10
+        # Compute biases
+        biases = self.biasfc(params).flatten() if self.biasfc else None
+        
         # Reshape input to combine batch with channels
         x = x.contiguous().view(1, B*in_channels, in_where)
         
@@ -622,7 +716,7 @@ class INFWhatMix(nn.Module):
         W = self.activation(self.fc2(F.relu(self.fc1(params)))).view(B*self.out_channels, in_channels, 1)
         
         # Abuse 'groups' parameter to perform a different conv for each out_channel
-        x = F.conv1d(x, W, groups=B).view(B, self.out_channels, in_where)
+        x = F.conv1d(x, W, bias=biases, groups=B).view(B, self.out_channels, in_where)
         
         return x
 
@@ -720,7 +814,7 @@ class WW_LSTM_stack(nn.Module):
     
     Args
     - in_shape: shape of the input to the first WWLSTMCell
-    - hidden_what: an iterable of the sizes of the 'what' dimension for the 
+    - hidden_what: an iterable of the siztion, bias)es of the 'what' dimension for the 
     hidden state. Its length is equal to number of stacked cells.
     - hidden_what: an iterable of the sizes of the 'where' dimension for the 
     hidden state. Its length is equal to number of stacked cells.
@@ -772,17 +866,125 @@ class WW_LSTM(nn.Module):
     def reset(self, batch_size):
         self.hidden_state, self.cell_state = self.core.init_hidden(batch_size)
         
-    def forward(self, x):
+    def forward(self, x, imaginary=False):
         if self.hidden_state is None:
             self.reset(x.shape[0]) #redundant, handled externally
         
         ch, cc = self.core(x, self.hidden_state, self.cell_state)
-            
-        self.hidden_state = ch
-        self.cell_state = cc
+        
+        # do not update states if doing a predictive/imaginary pass
+        if not imaginary:
+            self.hidden_state = ch
+            self.cell_state = cc
         
         return ch
         
+class WWPredictiveModule(nn.Module):
+    """
+    """
+    def __init__(self, WW_in, WW_out):
+        super(WWPredictiveModule, self).__init__()
+        self.layers = WhereMix(WW_in, WW_out)
+        self.out_shape = WW_out
+        
+    def forward(self, x):
+        return self.layers(x)
+
+class WW2convPredictiveModule(nn.Module):
+    def __init__(self, WW_in, out_shape):
+        super(WW2convPredictiveModule, self).__init__()
+        if out_shape[-3] == WW_in[0]:
+            self.layer = WhereMix(WW_in, (out_shape[-3],) + (out_shape[-1]*out_shape[-2],))
+        else:
+            self.layer = WWMix(WW_in, (out_shape[-3],) + (out_shape[-1]*out_shape[-2],))
+        self.out_shape = out_shape
+        
+    def forward(self, x):
+        return self.layer(x).view((x.shape[0],) + self.out_shape)
+
+class PreattentiveModule(nn.Module):
+    def __init__(self, in_params, mask_shape):
+        super(PreattentiveModule, self).__init__()
+        self.fc = nn.Linear(in_params, mask_shape)
+#        self.fc = nn.Sequential(nn.Linear(in_params, 32),
+#                                 nn.ReLU(),
+#                                 nn.Linear(32, mask_shape.numel()))
+        self.out_shape = mask_shape
+        
+    def forward(self, x, params):
+#        mask = torch.sigmoid(self.fc(params)).reshape((x.shape[0],) + self.out_shape)
+        mask = torch.sigmoid(self.fc(params)).unsqueeze(1)
+        return x * mask
+
+class PredictiveQKVModule(nn.Module):
+    def __init__(self, in_params, WW_in, out_shape):
+        super(PredictiveQKVModule, self).__init__()
+        self.queryfc = nn.Linear(in_params, out_shape[0])
+        self.keyWW = WWMix(WW_in, (out_shape[-3],) + (out_shape[-1]*out_shape[-2],))
+        self.valWW = WWMix(WW_in, (out_shape[-3],) + (out_shape[-1]*out_shape[-2],))
+        self.out_shape = out_shape
+        
+    def forward(self, x, params):
+        Q = F.relu(self.queryfc(params)[...,None,None])
+        K = F.relu(self.keyWW(x).view((x.shape[0],) + self.out_shape))
+        V = F.relu(self.valWW(x).view((x.shape[0],) + self.out_shape))
+        att = F.softmax((Q * K).sum(dim=1).flatten(1), dim=1)
+        
+        return V * att.view((x.shape[0],1,)+V.shape[2:])
+    
+class PredictiveQKVModulev2(nn.Module):
+    """locattentionv10"""
+    def __init__(self, val_in, key_in, out_shape):
+        super(PredictiveQKVModulev2, self).__init__()
+        self.queryfc = nn.Linear(64*5*5, out_shape[0])
+        self.keyWW = WWMix(key_in, (out_shape[-3],) + (out_shape[-1]*out_shape[-2],))
+        self.valWW = WWMix(val_in, (out_shape[-3],) + (out_shape[-1]*out_shape[-2],))
+        self.out_shape = out_shape
+        
+    def forward(self, x, Q_basis, K_basis):
+        Q = F.relu(self.queryfc(Q_basis.flatten(1))[...,None,None])
+        K = F.relu(self.keyWW(K_basis).view((x.shape[0],) + self.out_shape))
+        att = F.softmax((Q * K).sum(dim=1).flatten(1), dim=1)
+        
+        V = F.relu(self.valWW(x).view((x.shape[0],) + self.out_shape))
+        
+        return V * att.view((x.shape[0],1,)+V.shape[2:])
+
+#lookahead(perFE, q_basis, k_basis)
+class PredictiveQKVModulev3(nn.Module):
+    """locattentionv13, assumes same size input and output feature maps"""
+    def __init__(self, val_in, basis_shape, out_channels):
+        super(PredictiveQKVModulev3, self).__init__()
+        self.queryfc = nn.Linear(basis_shape.numel(), basis_shape[0])
+        self.valConv = nn.Conv2d(512, out_channels, 3, padding=1)
+        self.out_shape = torch.Size((out_channels,5,5))
+        
+    def forward(self, x, Q_basis, K_basis):
+        Q = F.relu(self.queryfc(Q_basis.flatten(1))[...,None,None])
+        K = K_basis
+        att = F.softmax((Q * K).sum(dim=1).flatten(1), dim=1)
+        
+        V = F.relu(self.valConv(x))
+        return V * att.view((x.shape[0],1,)+V.shape[2:])
+
+class PreattentiveQKVModule(nn.Module):
+    def __init__(self, in_params, WW_shape):
+        super(PreattentiveQKVModule, self).__init__()
+        self.queryfc = nn.Linear(in_params, WW_shape[0])
+        self.keywhereM = WhereMix(WW_shape, WW_shape)
+        self.valwhereM = WhereMix(WW_shape, WW_shape)
+        self.out_shape = WW_shape
+        
+    def forward(self, x, params):
+        Q = F.relu(self.queryfc(params)[...,None])
+        K = F.relu(self.keywhereM(x))
+        V = F.relu(self.valwhereM(x))
+        att = F.softmax((Q * K).sum(dim=1).flatten(1), dim=1)
+        mask = (V * att.view((x.shape[0],1,) + V.shape[2:])).sum(dim=1).unsqueeze(1)
+        
+        return x * mask
+
+
 #### endof WhatWhere stuff ####
         
 class PredictiveModule(nn.Module):
@@ -791,24 +993,22 @@ class PredictiveModule(nn.Module):
     - h_shape: the shape of the hidden state tensor.
     - aux_shape: the len of location tensors being concatenated to input.
     """
-    def __init__(self, h_shape, aux_shape, hidden=[256]):
+    def __init__(self, in_shape, target_shape, hidden=[256], act = nn.Tanh()):
         super(PredictiveModule, self).__init__()
-        self.dim = [h_shape + aux_shape] + hidden + [h_shape]
+        self.dim = [in_shape] + hidden + [target_shape]
         
         for i in range(len(self.dim)-1):
             self.add_module("fc{}".format(i), nn.Linear(self.dim[i], self.dim[i+1]))
         
         self.activation = nn.ReLU()
-        self.out_act = nn.Tanh()
-        
-    def reset(self):
-        self.bn.reset_parameters()
+        self.out_shape = target_shape
+        self.out_act = act
         
     def forward(self, x):
         for i in range(len(self.dim)-2):
             x = self.activation(getattr(self, "fc{}".format(i))(x))
         
-        #last fc, bn preactivation
+        #last fc
         x = getattr(self, "fc{}".format(len(self.dim)-2))(x)
         x = self.out_act(x)
         return x

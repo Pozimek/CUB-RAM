@@ -8,7 +8,7 @@ gpu: True
 rgb: True
 RAM:
   foveal_size: 37     #size of high-res patch
-  n_patches: 1
+  n_patches: 2
   scaling: 10    #scale of successive patches
   std: 0.05           #location net gaussian policy standard deviation
 training:
@@ -19,7 +19,7 @@ training:
   init_lr: 5.0e-3
   es: True              #early stopping
   delta: 0.5
-  patience: 25
+  patience: 40
   resume: False
   best: True
   M: 1                #validation stochasticity var

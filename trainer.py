@@ -50,12 +50,25 @@ class Trainer(object):
         self.counter = 0
         self.lr = C.training.init_lr
         self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=5e-3)
-#        self.optimizer = optim.AdamW(params, lr=5e-6, weight_decay = 1)
         self.lr_scheduler = lr_scheduler.StepLR(self.optimizer, 
                                                 step_size=10, gamma=0.5)
         
+        # imagination, excludes foveal memory and classifier
+        self.imagination_optimizer = optim.SGD([
+                {'params': self.model.glimpse_module.parameters()},
+                {'params': self.model.WW_module.parameters()},
+                {'params': self.model.posINF.parameters()},
+                {'params': self.model.peripheral_memory.parameters()},
+#                {'params': self.model.foveal_memory.parameters()},
+                {'params': self.model.lookahead.parameters()}
+                ], lr=self.lr, momentum=0.9)
+        self.ilr_scheduler = lr_scheduler.StepLR(self.imagination_optimizer, 
+                                                 step_size=10, gamma=0.5)
+        
+#        self.optimizer = optim.AdamW(params, lr=5e-6, weight_decay = 1)
+        
         #TODO scheduler hyperparams to config file?
-        self.gamma = 1
+        self.gamma = 0.2
         
         # set up logging
         if C.tensorboard:
@@ -87,6 +100,7 @@ class Trainer(object):
             
             # Update lr
             self.lr_scheduler.step()
+#            self.ilr_scheduler.step()
             
             # Log to tensorboard
             if self.C.tensorboard:
@@ -139,12 +153,12 @@ class Trainer(object):
         
         # Loss function modules for p-module.
         cos = nn.CosineSimilarity(dim=2)
+        wcos = nn.CosineSimilarity(dim=3)
         mae = nn.L1Loss(reduction='none')
         
         #loader: img, label, parts
         with tqdm(total=self.num_train) as pbar:
             for i, (x, y, y_locs) in enumerate(self.data_loader):
-                self.optimizer.zero_grad()
                 if self.C.gpu:
                     y = y.cuda()
                 x, y = Variable(x), Variable(y) #TODO: deprecated, check version
@@ -158,8 +172,19 @@ class Trainer(object):
                                          locs, y_locs)
                 
                 # predictive module loss
-#                loss_cos = 1 - cos(self.model.h[:,1:,:], self.model.ph[:,:-1,:])
-#                loss_mae = torch.mean(mae(self.model.ph[:,:-1,:], self.model.h[:,1:,:]), dim=2)
+                p_target = self.model.L3[:,1:,...]
+                loss_cos = 1 - cos(p_target.flatten(2), self.model.p_out[:,:-1,...].flatten(2))
+                
+                # other predictive module variables to log
+                loss_mae = torch.mean(mae(self.model.p_out[:,:-1,...], 
+                                          p_target), dim=(2,3,4))
+                cos_what = 1 - wcos(p_target, 
+                                    self.model.p_out[:,:-1,...]).mean(dim=(2,3))
+                self.model.fov_h = self.model.fov_h.detach()
+                fov_h_deltas = self.model.fov_h[:,1:,...].flatten(2) - self.model.fov_h[:,:-1,...].flatten(2)
+#                fov_ph_deltas = self.model.fov_h[:,1:,...].flatten(2) - self.model.fov_ph[:,:-1,...].flatten(2) #WRONG!
+                fov_ph_deltas = self.model.fov_ph[:,:-1,...].flatten(2) - self.model.fov_h[:,:-1,...].flatten(2)
+                imaginary_cos = 1 - cos(fov_h_deltas, fov_ph_deltas)
                 
                 # APC loss
 #                loss_cos = 1 - cos(self.model.g[:,1:,:], self.model.pg[:,:-1,:])
@@ -167,12 +192,18 @@ class Trainer(object):
 #                total_APCloss = torch.mean(torch.sum(loss_mae, dim=1))
 #                losses = losses + (self.gamma * total_APCloss,)
                 
-                # sum across timesteps, avg across batch
-#                total_lookahead = torch.mean(torch.sum(loss_mae, dim=1))
-#                losses = losses + (self.gamma * total_lookahead,)
+                # lookahead loss
+                total_lookahead = self.gamma * torch.mean(torch.sum(imaginary_cos, dim=1))
+#                total_lookahead.backward(retain_graph=True) 
+#                self.imagination_optimizer.step()
+#                self.imagination_optimizer.zero_grad()
+                
+                # classification loss
+                losses = losses + (total_lookahead,)
                 total_loss = sum(losses) if type(losses) is tuple else losses
                 total_loss.backward()
                 self.optimizer.step()
+                self.optimizer.zero_grad()
                 
                 # compute accuracy
                 correct = torch.max(log_probas[:,-1], 1)[1].detach() == y
@@ -196,26 +227,20 @@ class Trainer(object):
                             "Action_Loss_train" : loss_act.avg,
                             "Base_Loss_train" : loss_base.avg}, iteration)
                     
-#                    #log MAE, cosine dist and mse
-#                    MAE = torch.mean(loss_mae, dim=0)
-#                    COS = torch.mean(loss_cos, dim=0)
-#                    D = {"Total":total_APCloss}
-#                    for i in range(len(MAE)):
-#                        D["mae-T{}".format(i)] = MAE[i].item()
-#                        D["cos-T{}".format(i)] = COS[i].item()
-#                    self.writer.add_scalars('APC Loss/Training', 
-#                                            D, iteration)
-#                    
-#                    #log mean absolute activation for select p-module output
-#                    MAAp = torch.mean(torch.abs(self.model.pg[:,:-1,:]), dim=(0,2))
-#                    MAA = torch.mean(torch.abs(self.model.g[:,:-1,:]), dim=(0,2))
-#                    D = {}
-#                    for i in range(len(MAAp)):
-#                        D["MAAp-T{}".format(i)] = MAAp[i].item()
-#                        D["MAA-T{}".format(i)] = MAA[i].item()
-#                    self.writer.add_scalars('APC MAA/Training',
-#                                            D, iteration)
-                
+                    #log MAE, cosine dist and mse
+                    MAE = torch.mean(loss_mae, dim=0)
+                    COS = torch.mean(loss_cos, dim=0)
+                    WHAT_COS = torch.mean(cos_what, dim=0)
+                    I_COS = torch.mean(imaginary_cos, dim=0)
+                    D = {"Total":total_lookahead}
+                    for i in range(len(MAE)):
+                        D["mae-T{}".format(i)] = MAE[i].item()
+                        D["cos-T{}".format(i)] = COS[i].item()
+                        D["what_cos-T{}".format(i)] = WHAT_COS[i].item()
+                        D["i_cos-T{}".format(i)] = I_COS[i].item()
+                    self.writer.add_scalars('LookAhead Loss/Training', 
+                                            D, iteration)
+                    
                 # update status bar
                 toc = time.time()
                 pbar.set_description(
@@ -239,6 +264,7 @@ class Trainer(object):
         
         # Distance functions and loss modules for p-modules.
         cos = nn.CosineSimilarity(dim=2)
+        wcos = nn.CosineSimilarity(dim=3)
         mae = nn.L1Loss(reduction='none')
         
         for i, (x, y, y_locs) in enumerate(self.data_loader):
@@ -255,19 +281,32 @@ class Trainer(object):
                     log_probas, locs, log_pi, baselines = self.model(x)
                     
                     losses = self.model.loss(log_probas, log_pi, baselines, y, locs, y_locs)
-#                    
-#                    loss_cos = 1 - cos(self.model.h[:,1:,:], self.model.ph[:,:-1,:])
-#                    loss_mae = torch.mean(mae(self.model.ph[:,:-1,:], self.model.h[:,1:,:]), dim=2)
+                    
+                    # predictive module loss
+                    p_target = self.model.L3[:,1:,...]
+                    loss_cos = 1 - cos(p_target.flatten(2), self.model.p_out[:,:-1,...].flatten(2))
+                    
+                    # other predictive module variables to log
+                    loss_mae = torch.mean(mae(self.model.p_out[:,:-1,...], 
+                                              p_target), dim=(2,3,4))
+                    cos_what = 1 - wcos(p_target, 
+                                    self.model.p_out[:,:-1,...]).mean(dim=(2,3))
+                    fov_h_deltas = self.model.fov_h[:,1:,...].flatten(2) - self.model.fov_h[:,:-1,...].flatten(2)
+#                    fov_ph_deltas = self.model.fov_h[:,1:,...].flatten(2) - self.model.fov_ph[:,:-1,...].flatten(2) #WRONG!
+                    fov_ph_deltas = self.model.fov_ph[:,:-1,...].flatten(2) - self.model.fov_h[:,:-1,...].flatten(2)
+                    imaginary_cos = 1 - cos(fov_h_deltas, fov_ph_deltas)
                     
 #                    # APC loss
 #                    loss_cos = 1 - cos(self.model.g[:,1:,:], self.model.pg[:,:-1,:])
 #                    loss_mae = torch.mean(mae(self.model.pg[:,:-1,:], self.model.g[:,1:,:]), dim=2)
 #                    total_APCloss = torch.mean(torch.sum(loss_mae, dim=1))
 #                    losses = losses + (self.gamma * total_APCloss,)
-                    
-#                    #sum across timesteps, avg across batch
-#                    total_lookahead = torch.mean(torch.sum(loss_mae, dim=1))
-#                    losses = losses + (self.gamma * total_lookahead,)
+
+                    # lookahead loss
+                    total_lookahead = self.gamma * torch.mean(torch.sum(imaginary_cos, dim=1))
+
+                    # classification loss                    
+                    losses = losses + (total_lookahead,)
                     total_loss = sum(losses) if type(losses) is tuple else losses
                     
                     # compute accuracy
@@ -293,25 +332,19 @@ class Trainer(object):
                             "Action_Loss_val" : loss_act.avg,
                             "Base_Loss_val" : loss_base.avg}, iteration) 
     
-#                    #log MAE, cosine dist and mse
-#                    MAE = torch.mean(loss_mae, dim=0)
-#                    COS = torch.mean(loss_cos, dim=0)
-#                    D = {"Total":total_APCloss}
-#                    for i in range(len(MAE)):
-#                        D["mae-T{}val".format(i)] = MAE[i].item()
-#                        D["cos-T{}val".format(i)] = COS[i].item()
-#                    self.writer.add_scalars('APC Loss/Training', 
-#                                            D, iteration)
-#                    
-#                    #log mean absolute activation for select p-module output
-#                    MAAp = torch.mean(torch.abs(self.model.pg[:,:-1,:]), dim=(0,2))
-#                    MAA = torch.mean(torch.abs(self.model.g[:,:-1,:]), dim=(0,2))
-#                    D = {}
-#                    for i in range(len(MAAp)):
-#                        D["MAAp-T{}val".format(i)] = MAAp[i].item()
-#                        D["MAA-T{}val".format(i)] = MAA[i].item()
-#                    self.writer.add_scalars('APC MAA/Training',
-#                                            D, iteration)
+                    #log MAE, cosine dist and mse
+                    MAE = torch.mean(loss_mae, dim=0)
+                    COS = torch.mean(loss_cos, dim=0)
+                    WHAT_COS = torch.mean(cos_what, dim=0)
+                    I_COS = torch.mean(imaginary_cos, dim=0)
+                    D = {"Totalval":total_lookahead}
+                    for i in range(len(MAE)):
+                        D["mae-T{}val".format(i)] = MAE[i].item()
+                        D["cos-T{}val".format(i)] = COS[i].item()
+                        D["i_cos-T{}val".format(i)] = I_COS[i].item()
+                        D["what_cos-T{}val".format(i)] = WHAT_COS[i].item()
+                    self.writer.add_scalars('LookAhead Loss/Training', 
+                                            D, iteration)
                     
         print("Val epoch {} - avg acc: {:.2f} | avg loss: {:.3f}".format(
                 epoch, accs.avg, loss_t.avg))

@@ -12,6 +12,9 @@ import yaml
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+from torch import nn
+
+torch.pi = torch.acos(torch.zeros(1)).item() * 2
 
 # converts a nested dict to a nested object for ease of access
 class conf:
@@ -131,3 +134,22 @@ def gausskernel(sigma, channels):
     k = torch.from_numpy(np.stack(channels*[k], 0)).float() #group dim (dumb)
     
     return k
+
+def spatialbasis(h,w,U,V):
+    """ 
+    Compute a set of spatial basis tensors as described in Zoran et. al.
+    https://arxiv.org/pdf/1906.02500.pdf
+    """
+    bases = []
+    for u in range(1,U+1):
+        for v in range(1,V+1):
+            for Fy in [torch.cos, torch.sin]:
+                for Fx in [torch.cos, torch.sin]:
+                    X = Fx(torch.tensor([torch.pi*u*i/h for i in range(h)], device='cuda'))
+                    Y = Fy(torch.tensor([torch.pi*v*j/w for j in range(w)], device='cuda'))
+                    bases.append(torch.ger(X,Y))
+    return torch.stack(bases)
+
+def module_copy(module):
+    assert issubclass(type(module), nn.Module)
+    return type(module)(**kwargs).load_state_dict(module.state_dict())

@@ -14,6 +14,7 @@ Notes:
 """
 
 from torch.utils.data.dataset import Dataset
+from torch.utils.data.sampler import RandomSampler
 import pandas as pd
 import numpy as np
 import torch
@@ -21,7 +22,13 @@ from os.path import join, isfile
 from torchvision.datasets.folder import default_loader
 from utils import ir
 from torch.nn.functional import pad
+import random
 
+def seed_worker(worker_id):
+    #copied straight from pytorch website
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 def getSpeciesName(label):
     if type(label) is torch.Tensor:
@@ -64,13 +71,14 @@ class CUBDataset(Dataset):
     filename = 'CUB_200_2011.tgz'
     tgz_md5 = '97eceeb196236b17998738112f37df78'
     
-    def __init__(self, transform=None):
+    def __init__(self, transform=None, shuffle=False):
         self.root = './CUB_200_2011/'
         self.loader = default_loader
         self.transform = transform
         self.training = True
         self.num_classes = 200
         self.collate_pad = True #whether to correct part locs for padding
+#        self.shuffle = shuffle #whether to shuffle the dataset a single time (same across epochs)
         
         # Metadata
         images = pd.read_csv(join(self.root,'images.txt'), sep=' ', 
@@ -92,6 +100,8 @@ class CUBDataset(Dataset):
         
         #the data to be iterated over
         self.data = self.train_data if self.training == True else self.test_data
+        self.indices = [i for i in range(len(self.data))]
+#        if shuffle: self.shuffle_indices()
         
         if not self._check_integrity(): print("Integrity check failed.")
         
@@ -107,6 +117,7 @@ class CUBDataset(Dataset):
         return len(self.data)
         
     def __getitem__(self, index):
+#        i = self.indices[index] #needed if shuffling
         sample = self.data.iloc[index]
         path = join(self.root, 'images', sample.filepath)
         label = sample.label - 1 #label ids start at 1
@@ -126,41 +137,50 @@ class CUBDataset(Dataset):
 
         return img, label, parts
     
+#    def shuffle_indices(self):
+#        """using seed to maintain the same shuffling across calls"""
+#        with torch.random.fork_rng():
+#            torch.manual_seed(303)
+#            indices = torch.randperm(len(self.data)).tolist()
+#            return indices
+    
     def train(self):
         self.training = True
         self.data = self.train_data
+#        if self.shuffle: self.shuffle_indices()
         
     def test(self):
         self.training = False
         self.data = self.test_data
+#        if self.shuffle: self.shuffle_indices()
     
-    def subset(self, size):
-        """
-        Returns a randomly subsampled subset of the dataset. Only the training 
-        data is altered. The test data remains the same.
-        
-        - size: a fraction representing the size of the subset to be returned.
-        """
-        
-        #gather all training data entries
-        A = np.stack((self.train_data.index.values,
-                      self.train_data.label.values), -1)
-        subset_ids = np.array([])
-        
-        #for each class label
-        for label in range(1, 201):
-            #gather all label entries
-            L = A[A[:,1] == label]
-            
-            #shuffle using torch seeded rng
-            L = L[torch.randperm(len(L)).numpy()]
-            
-            #select img_ids to append to subset index list
-            ids = L[:ir(size*len(L)), 0]
-            subset_ids = np.concatenate((subset_ids, ids))
-            
-        #pass to subset creator
-        return CUBSubset(subset_ids, size, transform=self.transform)
+#    def subset(self, size):
+#        """
+#        Returns a randomly subsampled subset of the dataset. Only the training 
+#        data is altered. The test data remains the same.
+#        
+#        - size: a fraction representing the size of the subset to be returned.
+#        """
+#        
+#        #gather all training data entries
+#        A = np.stack((self.train_data.index.values,
+#                      self.train_data.label.values), -1)
+#        subset_ids = np.array([])
+#        
+#        #for each class label
+#        for label in range(1, 201):
+#            #gather all label entries
+#            L = A[A[:,1] == label]
+#            
+#            #shuffle using torch seeded rng
+#            L = L[torch.randperm(len(L)).numpy()]
+#            
+#            #select img_ids to append to subset index list
+#            ids = L[:ir(size*len(L)), 0]
+#            subset_ids = np.concatenate((subset_ids, ids))
+#            
+#        #pass to subset creator
+#        return CUBSubset(subset_ids, size, transform=self.transform)
     
     
 class CUBSubset(CUBDataset):

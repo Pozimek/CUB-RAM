@@ -14,7 +14,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
 from utils import conv_outshape, ir, out_shape
-from random import shuffle
 
 from modules import crude_retina, glimpse_module
 from modules import ConvLSTM, ActiveConvLSTM, FC_RNN
@@ -24,49 +23,24 @@ from modules import RAM_sensor, bnlstm, laRNN
 from modules import PositionalEmbeddingNet
 from modules import PredictiveModule, APCModule
 from modules import Bottleneck_module
-from modules import WW_module, WW_LSTM, WW_LSTM_stack, INFWhereMix, WhereMix, WhatMix, INFWWMix, WWMix
-from modules import Tclassifier
-
-def guide_fn(y_locs, timestep, stoch=True):
-    """
-    Given anatomical part locations and the timestep, returns the absolute 
-    fixation location for the network to look at based on a prioritized list.
-    Necessary due to occlusion: if desired part is not visible, the fn returns
-    the next most relevant location. Motivated by trying to preserve a
-    canonical order of exposure.
-    """
-    # A prioritized list of lists for hardcoded fixations. Canonical order.
-    #Roughly follows: head, legs, torso front, beak, tail/wings.
-    ALL_PRIORITIES = [
-            [ 6, 10,  5,  4, 14,  9,  1,  3,  2,  0,  8, 12,  7, 11, 13], #1
-            [ 7, 11,  2,  3, 14,  8, 12,  0,  9,  4,  5,  6, 10, 13,  1], #2
-            [ 3,  2, 14,  7, 11,  0,  1,  5,  6, 10,  4,  9, 12,  8, 13], #3
-            [ 1, 14,  5, 10,  6,  4,  9,  3,  2,  0,  7, 11,  8, 12, 13], #4
-            [13,  8, 12,  0,  9,  4, 14,  2,  3,  5,  1, 11,  7, 10,  6], #5
-            [0 ,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0]
-            ]
-
-    P = ALL_PRIORITIES[timestep]
-    fix = torch.zeros((y_locs.shape[0],2))
-    for priority in range(len(P)):
-        #choose y_locs to assign based on priorities but only insert them where one hasnt been assigned
-        ind = np.where((y_locs[:,P[priority],-1]==1) & (fix[:,0]==0) & (fix[:,1]==0))
-        fix[ind] = y_locs[ind, P[priority],:2]
-        if stoch:
-            noise = torch.zeros_like(fix[ind])
-            noise.data.normal_(std=4)
-            fix[ind] = fix[ind] + torch.round(noise)
-    
-    return fix.cuda()
+from modules import WW_module, WW_LSTM, WW_LSTM_stack, INFWhereMix, WhereMix, WhatMix, INFWWMix, WWMix, WWPredictiveModule
+from modules import PreattentiveModule
+from modules import WW2convPredictiveModule, PredictiveQKVModule, PreattentiveQKVModule, PredictiveQKVModulev2, PredictiveQKVModulev3
 
 class Guide():
     """
     Returns fixation locations in either canonical or custom order.
     Always shuffles fixation order during training.
     """
-    def __init__(self, T, training, Vmode, train_all = False):
+    def __init__(self, T, training, Vmode, sensor_width, train_all = False, 
+                 random_mix = False, rng_state = None):
+        outer_state = torch.get_rng_state()
+        torch.set_rng_state(rng_state)
+        
         self.T = T
         self.mode = Vmode
+        self.sensor_width = sensor_width
+        
         if self.mode == "canonical": self.order = [i for i in range(T)]
         elif self.mode == "MHL3": self.order = [3,0,4] 
         elif self.mode == "MHL5": self.order = [3,2,0,4,1]
@@ -75,18 +49,97 @@ class Guide():
         else: raise Exception("No such guide mode")
         if training: 
             if train_all: #make all fixations available during training via shuffle
-                shuffle(self.order)
+                self.shuffle(self.order)
             else: #shuffle only those fixations available at T
                 Tset = self.order[:T+1] 
-                shuffle(Tset)
+                self.shuffle(Tset)
                 self.order[:T+1] = Tset
-    
+        
+        #insert a token for a random fixation at every odd timestep
+        if random_mix:
+            new_order = [-1]*len(self.order)*2
+            new_order[::2] = self.order
+            self.order = new_order
+        
+        self.rng_state = torch.get_rng_state()
+        torch.set_rng_state(outer_state)
+           
     def __call__(self, y_locs, timestep, stoch=True):
+        outer_state = torch.get_rng_state() #TODO: implement as 'with' in utils
+        torch.set_rng_state(self.rng_state)
+        
         if timestep < self.T:
-            return guide_fn(y_locs, self.order[timestep], stoch)
+            if self.order[timestep] == -1:
+                fixation = self.random_guide(y_locs, timestep)
+            else: fixation = self.guide_fn(y_locs, self.order[timestep], stoch)
         else:
-            return guide_fn(y_locs, 5, stoch) #return dummy value
+            fixation = self.guide_fn(y_locs, 5, stoch) #return dummy value
+        
+        self.rng_state = torch.get_rng_state()
+        torch.set_rng_state(outer_state)
+        
+        return fixation
     
+    def shuffle(self, array):
+        new_order = torch.randperm(len(array))
+        return [array[i] for i in new_order]
+        
+    def guide_fn(self, y_locs, timestep, stoch=True):
+        """
+        Given anatomical part locations and the timestep, returns the absolute 
+        fixation location for the network to look at based on a prioritized list.
+        Necessary due to occlusion: if desired part is not visible, the fn returns
+        the next most relevant location. Motivated by trying to preserve a
+        canonical order of exposure.
+        """
+        # A prioritized list of lists for hardcoded fixations. Canonical order.
+        #Roughly follows: head, legs, torso front, beak, tail/wings.
+        ALL_PRIORITIES = [
+                [ 6, 10,  5,  4, 14,  9,  1,  3,  2,  0,  8, 12,  7, 11, 13], #1
+                [ 7, 11,  2,  3, 14,  8, 12,  0,  9,  4,  5,  6, 10, 13,  1], #2
+                [ 3,  2, 14,  7, 11,  0,  1,  5,  6, 10,  4,  9, 12,  8, 13], #3
+                [ 1, 14,  5, 10,  6,  4,  9,  3,  2,  0,  7, 11,  8, 12, 13], #4
+                [13,  8, 12,  0,  9,  4, 14,  2,  3,  5,  1, 11,  7, 10,  6], #5
+                [0 ,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0]
+                ]
+    
+        P = ALL_PRIORITIES[timestep]
+        fix = torch.zeros((y_locs.shape[0], 2))
+        for priority in range(len(P)):
+            #choose y_locs to assign based on priorities but only insert them where one hasnt been assigned
+            ind = np.where((y_locs[:,P[priority],-1]==1) & (fix[:,0]==0) & (fix[:,1]==0))
+            fix[ind] = y_locs[ind, P[priority],:2]
+            if stoch:
+                noise = torch.zeros_like(fix[ind])
+                noise.data.normal_(std=4)
+                fix[ind] = fix[ind] + torch.round(noise)
+        
+        return fix.cuda()
+    
+    def random_guide(self, y_locs, timestep):
+        """Produce random fixations that lie on the overlap of prior timestep's
+        fov and next timestep's fov."""
+        prior_fix = self.guide_fn(y_locs, self.order[timestep-1], stoch=False)
+        next_fix = self.guide_fn(y_locs, self.order[timestep+1], stoch=False)
+        
+        #gen coordinate ranges for prior and next
+        prior_from, prior_to = prior_fix - self.sensor_width, prior_fix + self.sensor_width
+        next_from, next_to = next_fix - self.sensor_width, next_fix + self.sensor_width
+        
+        overlap_from = torch.where((prior_from > next_from), prior_from, next_from).int()
+        overlap_to = torch.where((prior_to < next_to), prior_to, next_to).int()
+        
+        R = torch.zeros_like(prior_fix)
+        
+        #draw up random coord batches within the overlap
+        for i in range(len(next_from)):
+            R[i,0] = torch.randint(
+                    overlap_from[i,0].item(), overlap_to[i,0].item(), (1,))
+            R[i,1] = torch.randint(
+                    overlap_from[i,1].item(), overlap_to[i,1].item(), (1,))
+            
+        return R
+        
 class RAM_baseline(nn.Module):
     """ Vanilla RAM baseline with drop-in modules, most up-to-date version 
     as of may2021
@@ -134,7 +187,7 @@ class RAM_baseline(nn.Module):
         
         # Predictive module
 #        self.lookahead = PredictiveModule(self.rnn_hidden, 4)
-#        self.ph = None
+#        self.p_out = None
 #        self.h = None
         
         # Predictive Active Coding
@@ -174,7 +227,7 @@ class RAM_baseline(nn.Module):
             l_t_prev = self.reset(B=x.shape[0])
             
         locs, log_pis, baselines, log_probas = [l_t_prev], [], [], []
-#        self.ph = torch.zeros((x.shape[0], self.timesteps, self.rnn_hidden)).cuda()
+#        self.p_out = torch.zeros((x.shape[0], self.timesteps, self.rnn_hidden)).cuda()
 #        self.h = torch.zeros((x.shape[0], self.timesteps, self.rnn_hidden)).cuda()
         
         self.pg = torch.zeros((x.shape[0], self.timesteps, self.rnn_input)).cuda()
@@ -225,7 +278,7 @@ class RAM_baseline(nn.Module):
             
             # predictive module
 #            self.h[:,t,:] = h_t_flat.detach()
-#            self.ph[:,t,:] = self.lookahead(torch.cat((h_t_flat, l_t_prev, pos_t), 1))
+#            self.p_out[:,t,:] = self.lookahead(torch.cat((h_t_flat, l_t_prev, pos_t), 1))
             
             # store tensors
             locs.append(l_t_prev)
@@ -264,9 +317,8 @@ class RAM_baseline(nn.Module):
 #        # predictive module loss
 #        cos = nn.CosineSimilarity(dim=2)
 ##        loss_lookahead = torch.tensor(0)
-#        loss_lookahead = 1.5 * torch.sum(1 - cos(self.h[:,1:,:], self.ph[:,:-1,:]), dim=1)
+#        loss_lookahead = 1.5 * torch.sum(1 - cos(self.WWfov[:,1:,:], self.p_out[:,:-1,:]), dim=1)
 #        loss_lookahead = torch.mean(loss_lookahead, dim=0) #avg batch
-        
         
         if self.hardcoded_locs: 
             return loss_classify, torch.tensor(0), torch.tensor(0), torch.tensor(0)
@@ -314,31 +366,55 @@ class WW_RAM(nn.Module):
         self.gpu = gpu
         self.timesteps = 1
         self.T = torch.tensor((500,500), device='cuda') #image shape
+
+        # set separate seed for random fixations to reduce data stochasticity
+        with torch.random.fork_rng():
+            torch.manual_seed(303)
+            self.data_rng = torch.get_rng_state()
         
         # Sensor
         self.retina = retina
         self.k = self.retina.k #num of patches
-#        self.k = 1 #peronly hack
-        self.glimpse_module = glimpse_module(retina, feature_extractor, avgpool = False)
+        self.glimpse_module = glimpse_module(retina, feature_extractor, avgpool = False, spatial=True) #locattention v12
         
         # WW module
         WW_in_shape = self.glimpse_module.out_shape
-#        self.WW_where = 10
-        self.WW_where = 1
+        self.WW_where = 10
+        self.WW_what = self.glimpse_module.out_shape[0]
         self.WW_module = WW_module(WW_in_shape, self.WW_where, self.k)
         
         # Positional WhereMix
-#        self.posINF = INFWhereMix(2, self.WW_module.out_shape, 10)
         self.posINF = INFWhereMix(7, self.WW_module.out_shape, self.WW_where)
         
         # Memory
-        self.mem_in = self.WW_module.out_shape
-        self.mem_what = 512
-#        self.mem_where = 10
-        self.mem_where = 1
+        self.mem_in = self.posINF.out_shape
+        self.mem_what = 576
+        self.mem_where = 10
         self.mem_hidden = self.mem_what * self.mem_where
-        self.memory = WW_LSTM(self.mem_in, self.mem_what, self.mem_where, gate_op=WhereMix, in_op=WhereMix)
         
+        self.foveal_memory = WW_LSTM(self.mem_in, self.mem_what, self.mem_where, gate_op=WhereMix, in_op=WhereMix)
+        self.peripheral_memory = WW_LSTM(self.mem_in, self.mem_what, self.mem_where, gate_op=WhereMix, in_op=WhereMix)
+        
+        # Predictive module
+#        la_inparams = 2 + 2 + 5 #l_t, pos_t, t
+        laWW_in = torch.Size((self.mem_what, self.mem_where))
+        laWW_out = torch.Size((self.mem_what, self.mem_where))
+        
+#        self.preattention = PreattentiveModule(2, self.mem_where)
+#        self.lookahead = WWPredictiveModule(laWW_in, laWW_out)
+#        self.lookahead = PredictiveQKVModule(2, laWW_in, torch.Size((256, 5, 5)))
+#        self.lookahead = PredictiveQKVModulev2(laWW_in, torch.Size((64, self.mem_where)), torch.Size((256, 5, 5)))
+        laFE_in = (self.glimpse_module.out_shape[0]-64, self.glimpse_module.out_shape[1], self.glimpse_module.out_shape[2])
+        self.lookahead = PredictiveQKVModulev3(laFE_in, torch.Size((64, 5,5)), 256)
+#        self.preattention = PreattentiveQKVModule(2, laWW_in)
+#        self.lookahead = WW2convPredictiveModule(laWW_in, torch.Size((256, 5, 5)))
+        
+        self.p_out = None
+        self.WWfov = None
+        self.fov_h = None
+        self.fov_ph = None
+        
+        # Downstream
 #        fc_size = 512
 #        self.locator = location_network(self.mem_hidden, self.mem_hidden//2, std)
         self.classifier = classification_network_short(self.mem_hidden, 200)
@@ -347,7 +423,8 @@ class WW_RAM(nn.Module):
         
     def reset(self, B=1):
         """Initialize the hidden state and the location vectors at new batch."""
-        self.memory.reset(B)
+        self.foveal_memory.reset(B)
+        self.peripheral_memory.reset(B)
         self.glimpse_module.reset()
         dtype = (torch.cuda.FloatTensor if self.gpu else torch.FloatTensor)
         l_t = torch.Tensor(B,2).uniform_(-1, 1) #start at random location
@@ -365,7 +442,8 @@ class WW_RAM(nn.Module):
             x = x[0]
             _ = self.reset(B=x.shape[0])
             guide = Guide(self.timesteps, self.training, self.fixation_set, 
-                          train_all = self.full_set_training)
+                          self.retina.width, train_all = self.full_set_training,
+                          random_mix = True, rng_state = self.data_rng)
             l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
         else:
             l_t_prev = self.retina.to_exocentric_action(self.T, self.reset(B=x.shape[0]))
@@ -378,8 +456,15 @@ class WW_RAM(nn.Module):
         # position relative to initial fixation
         pos_t = torch.zeros_like(l_t_prev, device='cuda')
         
-        # classification bins
-#        a_t = Variable(torch.zeros((x.shape[0], 200), device='cuda'))
+        # predictive module vars
+        self.fov_ph = torch.zeros((x.shape[0], self.timesteps, self.mem_what, self.mem_where), device='cuda')
+        self.fov_h = torch.zeros((x.shape[0], self.timesteps, self.mem_what, self.mem_where), device='cuda')
+#        self.p_out = torch.zeros((x.shape[0], self.timesteps, self.WW_what, self.WW_where), device='cuda')
+        self.WWfov = torch.zeros((x.shape[0], self.timesteps, self.WW_what, self.WW_where), device='cuda')
+        self.FEfov = torch.zeros((x.shape[0], self.timesteps,) + self.glimpse_module.out_shape, device='cuda')
+        
+        self.p_out = torch.zeros((x.shape[0], self.timesteps,) + self.lookahead.out_shape, device='cuda')
+        self.L3 = torch.zeros((x.shape[0], self.timesteps,) + self.lookahead.out_shape, device='cuda')
         
         # process minibatch
         for t in range(self.timesteps):
@@ -387,38 +472,61 @@ class WW_RAM(nn.Module):
             if t!= 0: pos_t = pos_t + l_t_prev
             
             # Extract features, compute WW matrix
-            g_t = self.glimpse_module(x, l_t_prev)
+            g_t = self.glimpse_module(x, l_t_prev, pos_t)
             if t==0: l_t_prev = torch.zeros_like(l_t_prev, device='cuda') #mask out absolute coordinates at t=0
             g_t = [T.squeeze() for T in g_t]
             WWfov = self.WW_module(g_t[0])
-#            WWper = self.WW_module(g_t[1])
-#            WW = torch.cat((WWfov,WWper),dim=1) #along 'what' dim
-#            WW = torch.cat((WWfov,WWper),dim=2) #along 'where' dim
-            WW = WWfov
+            WWper = self.WW_module(g_t[1])
             
             # Apply PE
             time = torch.zeros((x.shape[0], 5), device='cuda')
             time[:,t] = 1.0
-            PE_in = torch.cat((pos_t, time), dim=1)
-            WW = self.posINF(WW, PE_in)
-#            WW = self.posINF(WW, pos_t)
+#            PE_in = torch.cat((pos_t, time), dim=1)
+            
+#            WWfov = self.posINF(WWfov, PE_in)
+#            WWper = self.posINF(WWper, PE_in)
             
             # memory
-            h_t = self.memory(WW)
-            h_t_flat = h_t.flatten(1,-1)
-#            
+            fov_h = self.foveal_memory(WWfov)
+            per_h = self.peripheral_memory(WWper)
+            
+            # downstream
+            fov_h_flat = fov_h.flatten(1,-1) 
 #            b_t = self.baseliner(h_t_flat).squeeze(0)
             b_t = torch.Tensor([0.]).cuda() #DUMMY 
             log_pi = torch.Tensor([0., 0.]).cuda() #DUMMY 
-            y_p = self.classifier(h_t_flat)
-#            a_t = self.classifier(h_t_flat, a_t)
+            y_p = self.classifier(fov_h_flat)
 
             # Decide where to look next            
             if self.require_locs:
                 l_t_prev = self.retina.to_egocentric_action(
                         guide(y_locs, t+1) - self.retina.fixation) 
             else: 
-                log_pi, l_t_prev = self.locator(h_t)
+                log_pi, l_t_prev = self.locator(fov_h, per_h)
+                
+            # predictive components
+#            la_params = torch.cat((l_t_prev, pos_t, time), dim=1)
+#            per_h = torch.cat((per_h, l_t_prev.unsqueeze(1).repeat(1, self.mem_what, 1)), dim=2)
+            
+            self.WWfov[:,t,...] = WWfov.detach()
+            self.FEfov[:,t,...] = g_t[0].detach()
+            self.L3[:,t,...] = self.glimpse_module.get_layerlog(3)
+            self.fov_h[:,t,...] = fov_h.detach()
+            
+#            la_in = self.preattention(per_h, l_t_prev)
+            q_basis = self.glimpse_module.sample_spatial(x, pos_t + l_t_prev)[:,0,...]
+#            k_basis = self.glimpse_module.sample_spatial(x, pos_t)[:,1,...] #alternative
+            k_basis = g_t[1][:,-64:,:]
+            perFE = g_t[1][:,:-64,:]
+            self.p_out[:,t,...] = self.lookahead(perFE, q_basis, k_basis)
+#            self.p_out[:,t,...] = self.lookahead(per_h, q_basis, k_basis)
+            
+            training = self.training
+            if training: self.eval()
+            i_in = self.WW_module(self.glimpse_module(self.p_out[:,t,...].clone(), l_t_prev, pos_t, imaginary=True))
+            if training: self.train()
+            
+            self.fov_ph[:,t,...] = self.foveal_memory(i_in, imaginary=True)
                 
             # store tensors
             locs.append(l_t_prev)
@@ -434,6 +542,9 @@ class WW_RAM(nn.Module):
         log_pis = torch.stack(log_pis).transpose(1, 0)
         log_probas = torch.stack(log_probas).transpose(1, 0)
         locs = torch.stack(locs).transpose(1, 0)
+        
+#         store fixation guide rng state
+#        self.data_rng = guide.rng_state
         
         return log_probas, locs, log_pis, baselines
     
