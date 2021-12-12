@@ -16,7 +16,6 @@ import torchvision.models
 from torchvision.models import resnet18, densenet121
 from torchvision.models.resnet import BasicBlock, ResNet
 from torchvision.models.densenet import DenseNet
-from torchvision.models.utils import load_state_dict_from_url
 
 from torch.autograd import Variable
 from torch.distributions import Normal
@@ -180,7 +179,7 @@ class retinocortical_sensor(RAM_sensor):
         
         for i, sample in enumerate(x):
             fixation = (coords[i,0].item(), coords[i,1].item())
-            #gpu retina bug workaround
+            #lazy gpu retina bug workaround
             if fixation[0] == 0: 
                 fixation = (fixation[0] + 1, fixation[1])
             if fixation[1] == 0:
@@ -318,6 +317,15 @@ class crude_retina(RAM_sensor):
             patch = torch.cat(patch)
             
         return patch
+    
+    def foveal_grid(self, x, unfold):
+        """Extract a grid of 20% overlapping foveal patches from the input."""
+        if self.gpu: x = x.cuda()
+#        crop = x.shape[-1]%-(self.g//-2) #trim peripheries
+#        x = x[:,:,crop:,crop:] #crop for unfold, assume square image
+        patches = unfold(x).permute(0,2,1).reshape(x.shape[0], -1, x.shape[1], self.g, self.g)
+        
+        return patches
 
     def exceeds(self, from_x, to_x, from_y, to_y, T):
         """
@@ -327,62 +335,567 @@ class crude_retina(RAM_sensor):
             return True
         return False
 
-class DenseNet_module(DenseNet):
-    #DenseNet feature extraction wrapper with ablation. Defaults to 121.
-    def __init__(self, layers = (6, 12, 24, 16), pretrained = True, 
-                 cleanup = False, maxpool = True, Tavgpool = True):
-        #32, (6, 12, 24, 16), 64
-        super(DenseNet_module, self).__init__(32, layers, 64)
-        self.layers = layers
-        self.num_blocks = len(layers)
-        self.remove_maxpool = not maxpool
-        self.Tpool = Tavgpool
-        
-        if pretrained:
-            assert self.layers == (6, 12, 24, 16)
-            self.load_state_dict(densenet121(pretrained=True).state_dict())
-        
-        # Remove unused layers
-        if not self.Tpool and self.num_blocks > 1:
-            for i in range(1,4):
-                Tblock = getattr(self.features, "transition{}".format(i))
-                delattr(Tblock, 'pool')
-        del(self.classifier)
-        if self.remove_maxpool: self.features.pool0 = nn.Identity() #idk why the redundancy
-        if cleanup: self.cleanup()
-        
-    def cleanup(self):
-        # delete unused blocks
-        for i in range(self.num_blocks+1,5):
-            delattr(self.features, "transition{}".format(i-1)) #ends with denseblock
-            delattr(self.features, "denseblock{}".format(i))
-            
-        ## Replace final batchnorm with a correctly sized layer
-        del(self.features.norm5)
-        
-        # Determine number of output features
-        #access last denseblock, last denselayer, last conv. Ughhhhhhh.
-        last_conv = next(reversed(next(reversed(self.features[-1]._modules.values()))._modules.values()))
-        growth_rate = last_conv.out_channels
-        num_features = 64
-        
-        for i, num_layers in enumerate(self.layers):
-            growth = num_layers * growth_rate
-            num_features += growth
-            if i != len(self.layers)-1:
-                num_features //= 2
-            
-        setattr(self.features, 'norm5', nn.BatchNorm2d(num_features))
-    
-    def load_weights(self, weights):
-        self.__init__(layers = self.layers, pretrained = False, cleanup = True,
-                      maxpol = not self.remove_maxpool, Tavgpool = self.Tpool)
-        self.load_state_dict(weights)
+class ResNetEncoder(nn.Module):
+    def __init__(self, in_shape, blocks = 4, pretrained = True, maxpool = True,
+                 stride = True):
+        super(ResNetEncoder, self).__init__()
+        resnet = list(resnet18(pretrained = pretrained).children())
+#        resnet = _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, False)
+        if not maxpool: del resnet[3]
+        if not stride:
+#            resnet[0].stride = (1,1)
+#            resnet[-5].conv1.stride = (1,1) #layer2
+#            resnet[-5].downsample[0].stride = (1,1)
+#            resnet[-4].conv1.stride = (1,1) #layer3
+#            resnet[-4].downsample[0].stride = (1,1)
+            resnet[-3][0].conv1.stride = (1,1) #layer4
+            resnet[-3][0].downsample[0].stride = (1,1)
+        trim = 2 + 4 - blocks
+        self.resnet = nn.Sequential(*resnet[:-trim])
+        self.out_shape = out_shape(self.resnet, in_shape)
         
     def forward(self, x):
-        features = self.features(x)
-        out = F.relu(features, inplace=True)
-        return out
+        return self.resnet(x)
+
+class VAR4Decoder(nn.Module):
+    def __init__(self, in_shape, C = [128,64,32,16,8], BN = True,
+                 activation = nn.ReLU(inplace=True)):
+        super(VAR4Decoder, self).__init__()
+        self.upsample1 = nn.ConvTranspose2d(in_shape[0], C[0], 2)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.upsample2 = nn.ConvTranspose2d(C[0], C[1], 3, stride=2)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.upsample3 = nn.ConvTranspose2d(C[1], C[2], 3, stride=2)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.upsample4 = nn.ConvTranspose2d(C[2], C[3], 3)
+        self.BN4 = nn.BatchNorm2d(C[3]) if BN else nn.Identity()
+        
+        self.layer4 = ResBlock(C[3], BN)
+        self.upsample5 = nn.ConvTranspose2d(C[3], C[4], 3, stride=2)
+        self.BN5 = nn.BatchNorm2d(C[4]) if BN else nn.Identity()
+        
+        self.layer5 = ResBlock(C[4], BN)
+        self.upsample6 = nn.ConvTranspose2d(C[4], 3, 3)
+        
+        self.act = activation
+        self.out_shape = out_shape(nn.Sequential(
+                self.upsample1, self.layer1, self.upsample2, self.layer2, 
+                self.upsample3, self.layer3, self.upsample4, self.layer4, 
+                self.upsample5, self.layer5, self.upsample6), in_shape)
+        
+    def forward(self, x):
+        x = self.act(self.BN(self.upsample1(x)))
+        x = self.act(self.BN2(self.upsample2(self.layer1(x))))
+        x = self.act(self.BN3(self.upsample3(self.layer2(x))))
+        x = self.act(self.BN4(self.upsample4(self.layer3(x))))
+        x = self.act(self.BN5(self.upsample5(self.layer4(x))))
+        reconstruction = torch.tanh(self.upsample6(self.layer5(x)))
+        return reconstruction
+
+class VAR1Encoder(nn.Module):
+    def __init__(self, in_shape, C = [32,64,64], BN = True, z_dim = 64,
+                 activation = nn.ReLU(inplace=True)):
+        super(VAR1Encoder, self).__init__()
+        self.stem = nn.Conv2d(in_shape[0], C[0], 5, stride=2, padding=1)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.downsample1 = nn.Conv2d(C[0], C[1], 4, stride=2, padding=1)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.downsample2 = nn.Conv2d(C[1], C[2], 4, stride=2, padding=1)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.downsample3 = nn.Conv2d(C[2], z_dim, 3, stride=1, padding=1)
+        
+        self.act = activation        
+        self.out_shape = out_shape(nn.Sequential(
+                self.stem, self.layer1, self.downsample1, self.layer2, 
+                self.downsample2, self.layer3, self.downsample3), in_shape)
+        
+    def forward(self, x):
+        x = self.act(self.BN(self.stem(x)))
+        x = self.act(self.BN2(self.downsample1(self.layer1(x))))
+        x = self.act(self.BN3(self.downsample2(self.layer2(x))))
+        x = self.act(self.downsample3(self.layer3(x)))
+        return x
+    
+class VAR2Encoder(nn.Module):
+    def __init__(self, in_shape, C = [32,64,64], BN = True, z_dim = 128,
+                 activation = nn.ReLU(inplace=True)):
+        super(VAR2Encoder, self).__init__()
+        self.stem = nn.Conv2d(in_shape[0], C[0], 5, stride=2, padding=1)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.downsample1 = nn.Conv2d(C[0], C[1], 3, stride=2, padding=1)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.downsample2 = nn.Conv2d(C[1], C[2], 3, stride=2, padding=1)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.downsample3 = nn.Conv2d(C[2], z_dim, 3, stride=2, padding=1)
+        
+        self.act = activation        
+        self.out_shape = out_shape(nn.Sequential(
+                self.stem, self.layer1, self.downsample1, self.layer2, 
+                self.downsample2, self.layer3, self.downsample3), in_shape)
+        
+    def forward(self, x):
+        x = self.act(self.BN(self.stem(x)))
+        x = self.act(self.BN2(self.downsample1(self.layer1(x))))
+        x = self.act(self.BN3(self.downsample2(self.layer2(x))))
+        x = self.act(self.downsample3(self.layer3(x)))
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, in_shape, C = [32,64,128], BN = True, z_dim = 256,
+                 activation = nn.ReLU(inplace=True)):
+        super(Encoder, self).__init__()
+        self.stem = nn.Conv2d(in_shape[0], C[0], 5, stride=2, padding=1)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.downsample1 = nn.Conv2d(C[0], C[1], 4, stride=2, padding=1)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.downsample2 = nn.Conv2d(C[1], C[2], 4, stride=2, padding=1)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.downsample3 = nn.Conv2d(C[2], z_dim, 3, stride=2, padding=1)
+        
+        self.act = activation        
+        self.out_shape = out_shape(nn.Sequential(
+                self.stem, self.layer1, self.downsample1, self.layer2, 
+                self.downsample2, self.layer3, self.downsample3), in_shape)
+        
+    def forward(self, x):
+        x = self.act(self.BN(self.stem(x)))
+        x = self.act(self.BN2(self.downsample1(self.layer1(x))))
+        x = self.act(self.BN3(self.downsample2(self.layer2(x))))
+        x = self.act(self.downsample3(self.layer3(x)))
+        return x
+
+class ResBlock(nn.Module):
+    def __init__(self, dim, BN = True):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(dim, dim, 3, 1, padding=1)
+        self.BN1 = nn.BatchNorm2d(dim) if BN else nn.Identity()
+        self.conv2 = nn.Conv2d(dim, dim, 1)
+        self.BN2 = nn.BatchNorm2d(dim) if BN else nn.Identity()
+        
+    def forward(self, x):
+        out = F.relu_(self.BN1(self.conv1(F.relu(x))))
+        out = self.BN2(self.conv2(out))
+        
+        return out + x
+    
+class ResBlockNew(nn.Module):
+    def __init__(self, dim, BN = True):
+        super(ResBlockNew, self).__init__()
+        self.conv1 = nn.Conv2d(dim, dim, 3, 1, padding=1)
+        self.BN1 = nn.BatchNorm2d(dim) if BN else nn.Identity()
+        self.conv2 = nn.Conv2d(dim, dim, 3, 1, padding=1)
+        self.BN2 = nn.BatchNorm2d(dim) if BN else nn.Identity()
+        
+    def forward(self, x):
+        out = F.relu_(self.BN1(self.conv1(F.relu(x))))
+        out = self.BN2(self.conv2(out))
+        
+        return out + x
+
+class VAR1Decoder(nn.Module):
+    def __init__(self, in_shape, C = [128,64,32], BN = True,
+                 activation = nn.ReLU(inplace=True)):
+        super(VAR1Decoder, self).__init__()
+        self.upsample1 = nn.ConvTranspose2d(in_shape[0], C[0], 4)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.upsample2 = nn.ConvTranspose2d(C[0], C[1], 4, stride=2)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.upsample3 = nn.ConvTranspose2d(C[1], C[2], 4, stride=2)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.upsample4 = nn.ConvTranspose2d(C[2], 3, 4)
+        
+        self.act = activation
+        self.out_shape = out_shape(nn.Sequential(
+                self.upsample1, self.layer1, self.upsample2, self.layer2, 
+                self.upsample3, self.layer3, self.upsample4), in_shape)
+        
+    def forward(self, x):
+        x = self.act(self.BN(self.upsample1(x)))
+        x = self.act(self.BN2(self.upsample2(self.layer1(x))))
+        x = self.act(self.BN3(self.upsample3(self.layer2(x))))
+        reconstruction = torch.tanh(self.upsample4(self.layer3(x)))
+        return reconstruction
+
+class VAR2Decoder(nn.Module):
+    def __init__(self, in_shape, C = [128,64,32], BN = True,
+                 activation = nn.ReLU(inplace=True)):
+        super(VAR2Decoder, self).__init__()
+        self.upsample1 = nn.ConvTranspose2d(in_shape[0], C[0], 4)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.upsample2 = nn.ConvTranspose2d(C[0], C[1], 5, stride=2)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.upsample3 = nn.ConvTranspose2d(C[1], C[2], 5, stride=2)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.upsample4 = nn.ConvTranspose2d(C[2], 3, 5)
+        
+        self.act = activation
+        self.out_shape = out_shape(nn.Sequential(
+                self.upsample1, self.layer1, self.upsample2, self.layer2, 
+                self.upsample3, self.layer3, self.upsample4), in_shape)
+        
+    def forward(self, x):
+        x = self.act(self.BN(self.upsample1(x)))
+        x = self.act(self.BN2(self.upsample2(self.layer1(x))))
+        x = self.act(self.BN3(self.upsample3(self.layer2(x))))
+        reconstruction = torch.tanh(self.upsample4(self.layer3(x)))
+        return reconstruction
+
+class Decoder(nn.Module):
+    def __init__(self, in_shape, C = [128,64,32], BN = True,
+                 activation = nn.ReLU(inplace=True)):
+        super(Decoder, self).__init__()
+        self.upsample1 = nn.ConvTranspose2d(in_shape[0], C[0], 5)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.upsample2 = nn.ConvTranspose2d(C[0], C[1], 5, stride=2)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.upsample3 = nn.ConvTranspose2d(C[1], C[2], 5, stride=2)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.upsample4 = nn.ConvTranspose2d(C[2], 3, 5)
+        
+        self.act = activation
+        self.out_shape = out_shape(nn.Sequential(
+                self.upsample1, self.layer1, self.upsample2, self.layer2, 
+                self.upsample3, self.layer3, self.upsample4), in_shape)
+        
+    def forward(self, x):
+        x = self.act(self.BN(self.upsample1(x)))
+        x = self.act(self.BN2(self.upsample2(self.layer1(x))))
+        x = self.act(self.BN3(self.upsample3(self.layer2(x))))
+        reconstruction = torch.tanh(self.upsample4(self.layer3(x)))
+        return reconstruction
+
+class FDecoder(nn.Module):
+    """Full fov decoder, produces a 500x500 img from Encoder's output"""
+    def __init__(self, in_shape, C = [128,64,32], BN = True):
+        super(FDecoder, self).__init__()
+        self.upsample1 = nn.ConvTranspose2d(in_shape[0], C[0], 2, stride=2)
+        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+        
+        self.layer1 = ResBlock(C[0], BN)
+        self.upsample2 = nn.ConvTranspose2d(C[0], C[1], 2, stride=2)
+        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+        
+        self.layer2 = ResBlock(C[1], BN)
+        self.upsample3 = nn.ConvTranspose2d(C[1], C[2], 2, stride=2)
+        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+        
+        self.layer3 = ResBlock(C[2], BN)
+        self.upsample4 = nn.ConvTranspose2d(C[2], 3, 6, stride=2)
+        
+        self.out_shape = out_shape(nn.Sequential(
+                self.upsample1, self.layer1, self.upsample2, self.layer2, 
+                self.upsample3, self.layer3, self.upsample4), in_shape)
+        
+    def forward(self, x):
+        x = F.relu_(self.BN(self.upsample1(x)))
+        x = F.relu_(self.BN2(self.upsample2(self.layer1(x))))
+        x = F.relu_(self.BN3(self.upsample3(self.layer2(x))))
+        reconstruction = torch.tanh(self.upsample4(self.layer3(x)))
+        return reconstruction
+
+
+class V(nn.Module):
+    """The variational bottleneck of a VAE."""
+    def __init__(self, map_shape, latent_size):
+        super(V, self).__init__()
+        self.fc_mu = nn.Linear(map_shape.numel(), latent_size)
+        self.fc_logsigma = nn.Linear(map_shape.numel(), latent_size)
+        self.fc_map = nn.Linear(latent_size, map_shape.numel())
+        
+        self.out_shape = map_shape
+        
+    def forward(self, x):
+        mu = self.fc_mu(x.flatten(1))
+        logsigma = self.fc_logsigma(x.flatten(1))
+        eps = torch.randn_like(logsigma)
+        
+        #Compute KLD here for convenience. Avg across 'batch of patches'.
+        self.KLD = -0.5 * (1 + 2 * logsigma - mu.pow(2) - (2 * logsigma).exp()).sum(1).mean()
+        
+        z = eps.mul(logsigma.exp()).add_(mu)
+        out_map = self.fc_map(z).reshape((x.shape[0],) + self.out_shape) # return conv map
+        
+        return out_map
+
+class WW_V(nn.Module):
+    """A variational bottleneck implemented with WW ops."""
+    def __init__(self, map_shape):
+        super(WW_V, self).__init__()
+        self.WW_mu = WW_module(map_shape, map_shape[-2:].numel())
+        self.WW_logsigma = WW_module(map_shape, map_shape[-2:].numel())
+        self.WW_map = nn.Sequential(WWMix(self.WW_mu.out_shape,
+                                          self.WW_mu.out_shape),
+                                    Reshape((-1,)+map_shape))
+        self.out_shape = map_shape
+        
+    def forward(self, x):
+        mu = self.WW_mu(x)
+        logsigma = self.WW_logsigma(x)
+        eps = torch.randn_like(logsigma)
+        
+        #Compute KLD here for convenience. Avg across 'batch of patches'.
+        self.KLD = -0.5 * (1 + 2 * logsigma - mu.pow(2) - (2 * logsigma).exp()).sum(1).mean()
+        
+        z = eps.mul(logsigma.exp()).add_(mu)
+        out_map = self.WW_map(z)
+        
+        return out_map
+
+### Old unused autoencoder pieces.
+#class ResBlock_old(nn.Module):
+#    def __init__(self, in_dim, out_dim, BN, stride=2):
+#        super(ResBlock_old, self).__init__()
+#        self.conv1 = nn.Conv2d(in_dim, out_dim, 3, stride, padding=1)
+#        self.BN1 = nn.BatchNorm2d(out_dim) if BN else nn.Identity()
+#        self.conv2 = nn.Conv2d(out_dim, out_dim, 3, padding=1)
+#        self.BN2 = nn.BatchNorm2d(out_dim) if BN else nn.Identity()
+#        self.skip = nn.Conv2d(in_dim, out_dim, 1, stride)
+#        
+#    def forward(self, x):
+#        out = F.relu_(self.BN1(self.conv1(x)))
+#        out = F.relu_(self.BN2(self.conv2(out)) + self.skip(x))
+#        
+#        return out
+#
+#class Encoder_old(nn.Module):
+#    def __init__(self, in_shape, C = [32,64,128], BN = True):
+#        super(Encoder_old, self).__init__()
+#        self.conv1 = nn.Conv2d(in_shape[0], C[0], 7, stride=3, padding=3)
+#        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+#        self.layer1 = ResBlock_old(C[0], C[1], BN)
+#        self.layer2 = ResBlock_old(C[1], C[2], BN)
+#        self.layer3 = ResBlock_old(C[2], 256, BN)
+#        
+#        self.out_shape = out_shape(nn.Sequential(
+#                self.conv1, self.layer1, self.layer2, self.layer3), in_shape)
+#        
+#    def forward(self, x):
+#        c1 = F.relu_(self.BN(self.conv1(x)))
+#        c2 = self.layer1(c1)
+#        c3 = self.layer2(c2)
+#        c4 = self.layer3(c3)
+#        
+#        return c4
+#
+#class Decoder_old(nn.Module):
+#    def __init__(self, in_shape, C = [128,64,32], BN = True):
+#        super(Decoder_old, self).__init__()
+#        self.deconv1 = nn.ConvTranspose2d(in_shape[0], C[0], 5)
+#        self.BN1 = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+#        self.deconv2 = nn.ConvTranspose2d(C[0], C[1], 5, stride=2)
+#        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+#        self.deconv3 = nn.ConvTranspose2d(C[1], C[2], 5, stride=2)
+#        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+#        self.deconv4 = nn.ConvTranspose2d(C[2], 3, 5)
+#        
+#        self.out_shape = out_shape(nn.Sequential(
+#                self.deconv1, self.deconv2, self.deconv3, self.deconv4), in_shape)
+#        
+#    def forward(self, x):
+#        x = F.relu(self.BN1(self.deconv1(x)))
+#        x = F.relu(self.BN2(self.deconv2(x)))
+#        x = F.relu(self.BN3(self.deconv3(x)))
+#        reconstruction = torch.tanh(self.deconv4(x))
+#        return reconstruction
+#
+#class Encoder1(nn.Module):
+#    def __init__(self, in_shape, C = [32,64,128], BN = True):
+#        super(Encoder1, self).__init__()
+#        self.conv1 = nn.Conv2d(in_shape[0], C[0], 7, stride=2, 
+#                               padding=3, bias=False)
+#        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+#        self.layer1 = ResBlock_old(C[0], C[1], BN)
+#        self.layer2 = ResBlock_old(C[1], C[2], BN)
+#        self.layer3 = ResBlock_old(C[2], 128, BN)
+#        
+#        self.out_shape = out_shape(nn.Sequential(
+#                self.conv1, self.layer1, self.layer2, self.layer3), in_shape)
+#        
+#    def forward(self, x):
+#        c1 = F.relu_(self.BN(self.conv1(x)))
+#        c2 = self.layer1(c1)
+#        c3 = self.layer2(c2)
+#        c4 = self.layer3(c3)
+#        
+#        return c4
+#
+#class Decoder1(nn.Module):
+#    def __init__(self, in_shape, C = [128,64,32], BN = True):
+#        super(Decoder1, self).__init__()
+#        self.deconv1 = nn.ConvTranspose2d(128, C[0], 5)
+#        self.BN1 = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+#        self.deconv2 = nn.ConvTranspose2d(C[0], C[1], 5, stride=2)
+#        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+#        self.deconv3 = nn.ConvTranspose2d(C[1], C[2], 5, stride=2)
+#        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+#        self.deconv4 = nn.ConvTranspose2d(C[2], 3, 5)
+#        self.trim = Trim((2,2))
+#        
+#        self.out_shape = out_shape(nn.Sequential(
+#                self.deconv1, self.deconv2, self.deconv3, self.deconv4, self.trim), in_shape)
+#        
+#    def forward(self, x):
+#        x = F.relu(self.BN1(self.deconv1(x)))
+#        x = F.relu(self.BN2(self.deconv2(x)))
+#        x = F.relu(self.BN3(self.deconv3(x)))
+#        reconstruction = self.trim(torch.tanh(self.deconv4(x)))
+#        return reconstruction
+#
+#class Trim(nn.Module):
+#    """Trims pixels from the edges. Assumes B,C,H,W input shape."""
+#    def __init__(self, px = (2,2)):
+#        super(Trim, self).__init__()
+#        assert type(px) is tuple
+#        self.px = px
+#        
+#    def forward(self, x):
+#        return x[:,:,self.px[0]:-self.px[0],self.px[1]:-self.px[1]]
+#
+#class Encoder3(nn.Module):
+#    def __init__(self, in_shape, C = [32,64,64,128], BN = True):
+#        super(Encoder3, self).__init__()
+#        self.conv1 = nn.Conv2d(in_shape[0], C[0], 7, stride=3, padding=2)
+#        self.BN = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+#        self.layer1 = ResBlock_old(C[0], C[1], BN, stride=1)
+#        self.layer2 = ResBlock_old(C[1], C[2], BN)
+#        self.layer3 = ResBlock_old(C[2], C[3], BN)
+#        self.layer4 = ResBlock_old(C[3], 256, BN)
+#        
+#        self.out_shape = out_shape(nn.Sequential(
+#                self.conv1, self.layer1, self.layer2, self.layer3, self.layer4), in_shape)
+#        
+#    def forward(self, x):
+#        x = F.relu_(self.BN(self.conv1(x)))
+#        x = self.layer1(x)
+#        x = self.layer2(x)
+#        x = self.layer3(x)
+#        x = self.layer4(x)
+#        
+#        return x
+#
+#class Decoder3(nn.Module):
+#    def __init__(self, in_shape, C = [128,64,64,32], BN = True):
+#        super(Decoder3, self).__init__()
+#        self.deconv1 = nn.ConvTranspose2d(in_shape[0], C[0], 4)
+#        self.BN1 = nn.BatchNorm2d(C[0]) if BN else nn.Identity()
+#        self.deconv2 = nn.ConvTranspose2d(C[0], C[1], 5, stride=2)
+#        self.BN2 = nn.BatchNorm2d(C[1]) if BN else nn.Identity()
+#        self.deconv3 = nn.ConvTranspose2d(C[1], C[2], 5, stride=2)
+#        self.BN3 = nn.BatchNorm2d(C[2]) if BN else nn.Identity()
+#        self.deconv4 = nn.ConvTranspose2d(C[2], C[3], 5)
+#        self.BN4 = nn.BatchNorm2d(C[3]) if BN else nn.Identity()
+#        self.deconv5 = nn.ConvTranspose2d(C[3], 3, 5)
+#        
+#        self.out_shape = out_shape(nn.Sequential(
+#                self.deconv1, self.deconv2, self.deconv3, self.deconv4, self.deconv5), in_shape)
+#        
+#    def forward(self, x):
+#        x = F.relu(self.BN1(self.deconv1(x)))
+#        x = F.relu(self.BN2(self.deconv2(x)))
+#        x = F.relu(self.BN3(self.deconv3(x)))
+#        x = F.relu(self.BN4(self.deconv4(x)))
+#        reconstruction = torch.tanh(self.deconv5(x))
+#        return reconstruction
+
+  
+###Accidentally deleted the class definition line here
+#    #DenseNet feature extraction wrapper with ablation. Defaults to 121.
+#    def __init__(self, layers = (6, 12, 24, 16), pretrained = True, 
+#                 cleanup = False, maxpool = True, Tavgpool = True):
+#        #32, (6, 12, 24, 16), 64
+#        super(DenseNet_module, self).__init__(32, layers, 64)
+#        self.layers = layers
+#        self.num_blocks = len(layers)
+#        self.remove_maxpool = not maxpool
+#        self.Tpool = Tavgpool
+#        
+#        if pretrained:
+#            assert self.layers == (6, 12, 24, 16)
+#            self.load_state_dict(densenet121(pretrained=True).state_dict())
+#        
+#        # Remove unused layers
+#        if not self.Tpool and self.num_blocks > 1:
+#            for i in range(1,4):
+#                Tblock = getattr(self.features, "transition{}".format(i))
+#                delattr(Tblock, 'pool')
+#        del(self.classifier)
+#        if self.remove_maxpool: self.features.pool0 = nn.Identity() #idk why the redundancy
+#        if cleanup: self.cleanup()
+#        
+#    def cleanup(self):
+#        # delete unused blocks
+#        for i in range(self.num_blocks+1,5):
+#            delattr(self.features, "transition{}".format(i-1)) #ends with denseblock
+#            delattr(self.features, "denseblock{}".format(i))
+#            
+#        ## Replace final batchnorm with a correctly sized layer
+#        del(self.features.norm5)
+#        
+#        # Determine number of output features
+#        #access last denseblock, last denselayer, last conv. Ughhhhhhh.
+#        last_conv = next(reversed(next(reversed(self.features[-1]._modules.values()))._modules.values()))
+#        growth_rate = last_conv.out_channels
+#        num_features = 64
+#        
+#        for i, num_layers in enumerate(self.layers):
+#            growth = num_layers * growth_rate
+#            num_features += growth
+#            if i != len(self.layers)-1:
+#                num_features //= 2
+#            
+#        setattr(self.features, 'norm5', nn.BatchNorm2d(num_features))
+#    
+#    def load_weights(self, weights):
+#        self.__init__(layers = self.layers, pretrained = False, cleanup = True,
+#                      maxpol = not self.remove_maxpool, Tavgpool = self.Tpool)
+#        self.load_state_dict(weights)
+#        
+#    def forward(self, x):
+#        features = self.features(x)
+#        out = F.relu(features, inplace=True)
+#        return out
 
 class ResNet18_module(ResNet):
     #Resnet18 wrapper with lots of tinkering
@@ -398,10 +911,12 @@ class ResNet18_module(ResNet):
             self.load_state_dict(resnet18(pretrained=True).state_dict())
         
         if cleanup: self.cleanup()
-        if self.remove_maxpool: self.maxpool = nn.Identity()
-        self.imaginary_i = 4
-        self.layer_logs = [0]*(blocks+1)
+        self.p_target = 4 #predictive module's target ResBlock
+        self.layer_logs = [[0]*(blocks+1), [0]*(blocks+1)]
         
+        # locattentionv33
+        self.patch = 0 #set by glimpse_module.
+        self.layer4b = deepcopy(self.layer4) #peripheral L4
     
     def cleanup(self):
         #delete unused layers
@@ -446,53 +961,20 @@ class ResNet18_module(ResNet):
         x = self.bn1(x)
         x = self.relu(x)
         x = self.maxpool(x)
+        self.layer_logs[self.patch][0] = x.detach()
         
         for i in range(1, self.num_blocks+1):
-            x = getattr(self, "layer{}".format(i))(x)
-            self.layer_logs[i] = x.detach()
+            if i==4 and self.patch == 1:
+                x = self.layer4b(x) #locattentionv33: duplicate L4 for peripheral stream
+            else: x = getattr(self, "layer{}".format(i))(x)
+            self.layer_logs[self.patch][i] = x.detach()
         
         return x
     
     def im_forward(self, x):
-        for i in range(self.imaginary_i, self.num_blocks+1):
+        for i in range(self.p_target, self.num_blocks+1):
             x = getattr(self, "layer{}".format(i))(x)
         return x
-
-#class ResConvLSTM(ResNet):
-#    #An abomination
-#    def __init__(self, blocks = 4, cells = [0,0,1], pretrained = True, cleanup = True, maxpool = True):
-#        super(ResConvLSTM, self).__init__(BasicBlock, [2, 2, 2, 2])
-#        assert len(cells) == 3 and type(cells) is list
-#        self.num_blocks = blocks
-#        self.remove_maxpool = not maxpool
-#        
-#        if pretrained:
-#            self.load_state_dict(resnet18(pretrained=True).state_dict())
-#            
-#        if cleanup: self.cleanup()
-#        if self.remove_maxpool: self.maxpool = nn.Identity()
-#        
-#        self.cellids = torch.where(torch.Tensor(cells))
-#        self.cells = ConvLSTM
-#        
-#    def cleanup(self):
-#        #delete unused layers
-#        for i in range(self.num_blocks+1, 5):
-#            setattr(self, "layer{}".format(i), None)
-#        
-#        #correct maxpool?
-#        if self.remove_maxpool: self.maxpool = nn.Identity()
-#        
-#    def forward(self, x):
-#        x = self.conv1(x)
-#        x = self.bn1(x)
-#        x = self.relu(x)
-#        x = self.maxpool(x)
-#        
-#        for i in range(1, self.num_blocks+1):
-#            x = getattr(self, "layer{}".format(i))(x)
-#        
-#        return x
 
 class glimpse_module(nn.Module):
     def __init__(self, retina, feature_extractor, avgpool = False, spatial = False, BN = True):
@@ -510,12 +992,10 @@ class glimpse_module(nn.Module):
         else:
             self.out_shape = out_shape(self.feature_extractor, retina.out_shape)
             
+        self.spatial_retina = deepcopy(retina)
+        self.spatial_retina.g = self.out_shape[-1] # for FE appending
+        self.sbasis = spatialbasis(1000, 1000, 4, 4).unsqueeze(0)
         if self.spatial:
-#            self.retina.out_shape = (67, self.retina.g, self.retina.g)
-            self.spatial_retina = deepcopy(retina) #not sure about this
-            self.spatial_retina.g = self.out_shape[-1] # for FE appending
-#            self.spatial_retina.downsampling_mode = 'area'
-            self.sbasis = spatialbasis(1000, 1000, 4, 4).unsqueeze(0)
             self.out_shape = (self.out_shape[0]+64, self.out_shape[1], self.out_shape[2])
         
         # Use separate BN modules for each patch. Might break blocks param
@@ -529,7 +1009,10 @@ class glimpse_module(nn.Module):
         appropriate BNs, ie different BN for fovea and periphery. 
         Might be invariant to feature extractor used, might break 'blocks'
         functionality of the FE wrappers. Voodoo
-        Also disables BN depending on the flag."""
+        Also disables BN depending on the self.disable_BN flag.
+        Also tells the feature extractor what patch is being processed so it
+        can choose its layers properly."""
+        self.feature_extractor.patch = patch
         if moddict is None: moddict = self.feature_extractor._modules
         index = j
         for i, key in enumerate(moddict.keys()):
@@ -592,8 +1075,8 @@ class glimpse_module(nn.Module):
         if self.avgpool: features = self.avgpool(features)
         return features
     
-    def get_layerlog(self, i):
-        return self.feature_extractor.layer_logs[i]
+    def get_layerlog(self, i, patch=0):
+        return self.feature_extractor.layer_logs[patch][i]
 
 class PositionalEmbeddingNet(nn.Module):
     def __init__(self, out_shape, hidden = [9, 9]):
@@ -645,7 +1128,7 @@ class WW_module(nn.Module):
     - in_shape: the spatial dimensions of the input feature maps
     - out_channels: the size of 'where' dim, ie the number of distributions
     """
-    def __init__(self, in_shape, out_channels, k):
+    def __init__(self, in_shape, out_channels, k=1):
         super(WW_module, self).__init__()
         self.spatial = in_shape[1:]
         self.W = nn.Parameter(
@@ -688,6 +1171,33 @@ class WWMix(nn.Module):
     
     def forward(self, x):
         return self.where(self.what(x))
+
+class Mix_ResBlock(nn.Module):
+    """ A resblock, but the conv operation is replaced with a WhereMix"""
+    def __init__(self, shape, BN = True):
+        super(Mix_ResBlock, self).__init__()
+        self.mix1 = WhereMix(shape, shape)
+        self.BN1 = nn.BatchNorm2d(shape[0]) if BN else nn.Identity()
+        self.mix2 = WhereMix(shape, shape)
+        self.BN2 = nn.BatchNorm2d(shape[0]) if BN else nn.Identity()
+        
+        self.out_shape = shape
+        
+    def forward(self, x):
+        out = self.mix1(F.relu(x))
+        out = F.relu_(self.BN1(out.unsqueeze(-1)).squeeze(-1))
+        out = self.BN2(self.mix2(out).unsqueeze(-1)).squeeze(-1)
+        
+        return out + x
+
+class WW_BN(nn.Module):
+    """ BN with a modified forward pass for WW matrix input"""
+    def __init__(self, dim):
+        super(WW_BN, self).__init__()
+        self.BN = nn.BatchNorm2d(dim)
+    
+    def forward(self, x):
+        return self.BN(x.transpose(1,2).unsqueeze(-1)).squeeze(-1).transpose(1,2)
 
 class INFWhatMix(nn.Module):
     """
@@ -925,14 +1435,16 @@ class PredictiveQKVModule(nn.Module):
         self.out_shape = out_shape
         
     def forward(self, x, params):
+        #XXX: attn is supposed to be using the @ operator!!!
         Q = F.relu(self.queryfc(params)[...,None,None])
         K = F.relu(self.keyWW(x).view((x.shape[0],) + self.out_shape))
         V = F.relu(self.valWW(x).view((x.shape[0],) + self.out_shape))
-        att = F.softmax((Q * K).sum(dim=1).flatten(1), dim=1)
+        att = F.softmax((Q * K).sum(dim=1).flatten(1), dim=1) 
         
         return V * att.view((x.shape[0],1,)+V.shape[2:])
     
 class PredictiveQKVModulev2(nn.Module):
+    #XXX: attn is supposed to be using the @ operator!!!
     """locattentionv10"""
     def __init__(self, val_in, key_in, out_shape):
         super(PredictiveQKVModulev2, self).__init__()
@@ -952,11 +1464,12 @@ class PredictiveQKVModulev2(nn.Module):
 
 #lookahead(perFE, q_basis, k_basis)
 class PredictiveQKVModulev3(nn.Module):
+    #XXX: attn is supposed to be using the @ operator!!! 
     """locattentionv13, assumes same size input and output feature maps"""
     def __init__(self, val_in, basis_shape, out_channels):
         super(PredictiveQKVModulev3, self).__init__()
-        self.queryfc = nn.Linear(basis_shape.numel(), basis_shape[0])
-        self.valConv = nn.Conv2d(512, out_channels, 3, padding=1)
+        self.queryfc = nn.Linear(2, basis_shape[0])
+        self.valConv = nn.Conv2d(val_in, out_channels, 3, padding=1)
         self.out_shape = torch.Size((out_channels,5,5))
         
     def forward(self, x, Q_basis, K_basis):
@@ -984,6 +1497,14 @@ class PreattentiveQKVModule(nn.Module):
         
         return x * mask
 
+class QueryNetwork(nn.Module):
+    def __init__(self, in_shape=2, out_shape = (64,5,5)):
+        super(QueryNetwork, self).__init__()
+        self.out_shape = torch.Size(out_shape)
+        self.fc = nn.Linear(in_shape, self.out_shape.numel())
+        
+    def forward(self, x):
+        return self.fc(x).view((x.shape[0],)+self.out_shape)
 
 #### endof WhatWhere stuff ####
         
@@ -1534,3 +2055,11 @@ class baseline_network(nn.Module):
         b_t = F.relu(self.fc2(b_t))
         
         return b_t
+    
+class Reshape(nn.Module):
+    def __init__(self, shape):
+        super(Reshape, self).__init__()
+        self.shape = shape
+
+    def forward(self, x):
+        return x.view(self.shape)

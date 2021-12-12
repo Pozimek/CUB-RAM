@@ -24,13 +24,15 @@ from modules import PositionalEmbeddingNet
 from modules import PredictiveModule, APCModule
 from modules import Bottleneck_module
 from modules import WW_module, WW_LSTM, WW_LSTM_stack, INFWhereMix, WhereMix, WhatMix, INFWWMix, WWMix, WWPredictiveModule
-from modules import PreattentiveModule
+from modules import PreattentiveModule, QueryNetwork
 from modules import WW2convPredictiveModule, PredictiveQKVModule, PreattentiveQKVModule, PredictiveQKVModulev2, PredictiveQKVModulev3
 
 class Guide():
     """
     Returns fixation locations in either canonical or custom order.
     Always shuffles fixation order during training.
+    
+    An abomination of a class that makes me disappointed with my past self.
     """
     def __init__(self, T, training, Vmode, sensor_width, train_all = False, 
                  random_mix = False, rng_state = None):
@@ -139,7 +141,50 @@ class Guide():
                     overlap_from[i,1].item(), overlap_to[i,1].item(), (1,))
             
         return R
+   
+class PAM(nn.Module):
+    """ Predictive Attention Model
+    See: 'Restructuring note' in Keep, October 2021."""
+    def __init__(self, name, retina, encoder, decoder, bottleneck, FE, memory, 
+                 classifier, gpu):
+        super(PAM, self).__init__()
+        # Config
+        self.name = name
+        self.gpu = gpu
         
+        # Sensor
+        self.retina = retina
+        
+        # Foveal autoencoder
+        self.fov_encoder = encoder
+        self.fov_decoder = decoder
+        self.bottleneck = bottleneck
+        self.bottleneck.KLD = torch.tensor(0., device='cuda')
+        self.AE = nn.Sequential(self.fov_encoder, self.bottleneck, self.fov_decoder)
+        
+        # Classification stream
+        self.FE = FE #further feature extraction and/or WW module.
+        self.memory = memory
+        self.classifier = classifier
+        
+        # Peripheral stream
+        self.HAS = nn.Identity()
+        self.per_encoder = nn.Identity()
+        self.fixation_module = nn.Identity()
+        self.SR = nn.Identity()
+    
+    def forward(self, x):
+        return 0
+    
+    def reset(self, B=1):
+        """Initialize the hidden state and the location vectors at new batch."""
+        self.memory.reset(B)
+        dtype = (torch.cuda.FloatTensor if self.gpu else torch.FloatTensor)
+        l_t = torch.Tensor(B,2).uniform_(-1, 1) #start at random location
+        l_t = Variable(l_t).type(dtype)
+
+        return l_t
+    
 class RAM_baseline(nn.Module):
     """ Vanilla RAM baseline with drop-in modules, most up-to-date version 
     as of may2021
@@ -375,7 +420,8 @@ class WW_RAM(nn.Module):
         # Sensor
         self.retina = retina
         self.k = self.retina.k #num of patches
-        self.glimpse_module = glimpse_module(retina, feature_extractor, avgpool = False, spatial=True) #locattention v12
+        self.glimpse_module = glimpse_module(retina, feature_extractor, 
+                                             avgpool = False, spatial = True)
         
         # WW module
         WW_in_shape = self.glimpse_module.out_shape
@@ -387,8 +433,8 @@ class WW_RAM(nn.Module):
         self.posINF = INFWhereMix(7, self.WW_module.out_shape, self.WW_where)
         
         # Memory
-        self.mem_in = self.posINF.out_shape
-        self.mem_what = 576
+        self.mem_in = torch.Size((self.WW_what, self.WW_where))
+        self.mem_what = 512+64
         self.mem_where = 10
         self.mem_hidden = self.mem_what * self.mem_where
         
@@ -404,8 +450,9 @@ class WW_RAM(nn.Module):
 #        self.lookahead = WWPredictiveModule(laWW_in, laWW_out)
 #        self.lookahead = PredictiveQKVModule(2, laWW_in, torch.Size((256, 5, 5)))
 #        self.lookahead = PredictiveQKVModulev2(laWW_in, torch.Size((64, self.mem_where)), torch.Size((256, 5, 5)))
-        laFE_in = (self.glimpse_module.out_shape[0]-64, self.glimpse_module.out_shape[1], self.glimpse_module.out_shape[2])
+        laFE_in = 512
         self.lookahead = PredictiveQKVModulev3(laFE_in, torch.Size((64, 5,5)), 256)
+        self.querynet = QueryNetwork()
 #        self.preattention = PreattentiveQKVModule(2, laWW_in)
 #        self.lookahead = WW2convPredictiveModule(laWW_in, torch.Size((256, 5, 5)))
         
@@ -476,7 +523,7 @@ class WW_RAM(nn.Module):
             if t==0: l_t_prev = torch.zeros_like(l_t_prev, device='cuda') #mask out absolute coordinates at t=0
             g_t = [T.squeeze() for T in g_t]
             WWfov = self.WW_module(g_t[0])
-            WWper = self.WW_module(g_t[1])
+#            WWper = self.WW_module(g_t[1])
             
             # Apply PE
             time = torch.zeros((x.shape[0], 5), device='cuda')
@@ -488,7 +535,7 @@ class WW_RAM(nn.Module):
             
             # memory
             fov_h = self.foveal_memory(WWfov)
-            per_h = self.peripheral_memory(WWper)
+#            per_h = self.peripheral_memory(WWper)
             
             # downstream
             fov_h_flat = fov_h.flatten(1,-1) 
@@ -514,11 +561,14 @@ class WW_RAM(nn.Module):
             self.fov_h[:,t,...] = fov_h.detach()
             
 #            la_in = self.preattention(per_h, l_t_prev)
-            q_basis = self.glimpse_module.sample_spatial(x, pos_t + l_t_prev)[:,0,...]
+#            ablated_loc = torch.zeros_like(pos_t)
+#            q_basis = self.glimpse_module.sample_spatial(x, l_t_prev)[:,0,...]
+#            q_basis = self.glimpse_module.sample_spatial(x, ablated_loc)[:,0,...]
+#            q_basis = self.querynet(l_t_prev)
 #            k_basis = self.glimpse_module.sample_spatial(x, pos_t)[:,1,...] #alternative
             k_basis = g_t[1][:,-64:,:]
             perFE = g_t[1][:,:-64,:]
-            self.p_out[:,t,...] = self.lookahead(perFE, q_basis, k_basis)
+            self.p_out[:,t,...] = self.lookahead(perFE, l_t_prev, k_basis)
 #            self.p_out[:,t,...] = self.lookahead(per_h, q_basis, k_basis)
             
             training = self.training

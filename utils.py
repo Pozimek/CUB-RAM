@@ -13,6 +13,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from torch import nn
+import os
 
 torch.pi = torch.acos(torch.zeros(1)).item() * 2
 
@@ -78,14 +79,18 @@ def showArray(array, size=(8,8), cmap = None):
 def showPIL(PIL, size=(8,8), cmap=None):
     array = np.array(PIL)[...,:3]
     showArray(array, size, cmap)
+
+def showFixedTensor(tensor, size = (8,8), cmap = None, bgr2rgb = False):
+    fixed = (tensor - tensor.min()).permute(1,2,0) 
+    fixed = fixed/fixed.max()
+    if bgr2rgb: fixed = fixed[:,:,[2,1,0]]
+    showTensor(fixed, size, cmap)
     
 def showTensor(tensor, size=(8,8), cmap=None):
     if tensor.device.type == 'cuda': tensor = tensor.cpu()
-#    array = np.moveaxis(tensor.numpy(), 0, -1) #why did you even do this?
-    array = tensor.numpy()
+    array = tensor.detach().numpy()
     showArray(array, size, cmap)
  
-    
 #OH BOY PYTHON 3 SURELY HURTS
 def normal_round(n):
     if n - np.floor(np.abs(n)) < 0.5:
@@ -153,3 +158,39 @@ def spatialbasis(h,w,U,V):
 def module_copy(module):
     assert issubclass(type(module), nn.Module)
     return type(module)(**kwargs).load_state_dict(module.state_dict())
+
+def set_seed(seed, gpu=True):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    if gpu:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.cuda.manual_seed(seed)
+        
+def validate_values(tensor):
+    return not (torch.isinf(tensor).any() or torch.isnan(tensor).any())
+
+def print_patch(tensor, y, x, w=3):
+    print(tensor[y-w//2:y+1+w//2, x-w//2:x+1+w//2])
+    
+def d(T):
+    """ compute distance from origin for a xy coord tensor"""
+    return torch.sqrt((T[0]**2 + T[1]**2))
+
+
+def get_mean_and_std(dataloader):
+    """Lazy, borrowed from https://towardsdatascience.com/how-to-calculate-the-mean-and-standard-deviation-normalizing-datasets-in-pytorch-704bd7d05f4c"""
+    channels_sum, channels_squared_sum, num_batches = 0, 0, 0
+    for data, _ in dataloader:
+        # Mean over batch, height and width, but not over the channels
+        channels_sum += torch.mean(data, dim=[0,2,3])
+        channels_squared_sum += torch.mean(data**2, dim=[0,2,3])
+        num_batches += 1
+    
+    mean = channels_sum / num_batches
+
+    # std = sqrt(E[X^2] - (E[X])^2)
+    std = (channels_squared_sum / num_batches - mean ** 2) ** 0.5
+
+    return mean, std

@@ -37,7 +37,7 @@ def main(config):
     dataset = CUBDataset(transform = transform, shuffle=True)
     retina = crude_retina(config.RAM.foveal_size, config.RAM.n_patches, 
                               config.RAM.scaling, config.gpu, clamp = False)
-    namestring = "retina-WWRAMfix-locattentionv27-{}s{}"
+    namestring = "retina-WWRAMfix-locattentionv35-{}s{}"
     config.name = namestring.format(0, config.seed)
     
     for steps in range(5,6):
@@ -60,7 +60,7 @@ def main(config):
         trainer.train()
 
 if __name__ == '__main__':
-    for seed in [1, 777, 9001]:
+    for seed in [9001]:
         config = get_ymlconfig('./dispatch.yml')
         config.seed = seed
         main(config)

@@ -64,15 +64,15 @@ def predictive_mem_test(config):
     retina = crude_retina(config.RAM.foveal_size, config.RAM.n_patches, 
                               config.RAM.scaling, config.gpu, clamp=False)
     
-    modelstrings = ["retina-WWRAMfix-imaginationv26-{}"]
+    modelstrings = ["retina-WWRAMfix-locattentionv28-{}s9001"]
     fixation_sets = ["MHL3"]
     
-    for model_T in [3]:
+    for model_T in [5]:
         for M in modelstrings:
             config.name = M.format(model_T)
             print(" ")
             print("Validating ", config.name, "...")
-            feature_extractor = ResNet18_module(blocks=4, maxpool=False, stride=True)
+            feature_extractor = ResNet18_module(blocks=4, pretrained = True, maxpool=False, stride=False)
             
             for fixation_set in fixation_sets:
                 print("         ... with fixation set", fixation_set)
@@ -135,6 +135,10 @@ def predictive_mem_test(config):
                         
 #                        p_target = model.WWfov[:,1:,...]
                         p_target = model.L3[:,1:,...]
+                        
+                        pt_cos = 1 - cos(model.L3[:,1:,...].flatten(2), model.L3[:,:-1,...].flatten(2))
+                        print("pt_cos:", pt_cos.mean())
+                        
                         loss_cos = 1 - cos(p_target.flatten(2), model.p_out[:,:-1,...].flatten(2))
                         print("loss_cos:", loss_cos.mean())
                         

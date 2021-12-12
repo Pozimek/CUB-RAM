@@ -14,6 +14,7 @@ import time
 import shutil
 from tqdm import tqdm
 from utils import AverageMeter
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -37,7 +38,19 @@ class Trainer(object):
         # model
         self.model = model
         if C.gpu: self.model.cuda()
-        params = self.model.parameters()
+#        params = self.model.parameters()
+        #locattentionv29: excluding L123 in ResNet, only optimizing L4 onwards.
+        params = [
+                {'params': self.model.glimpse_module.feature_extractor.layer4.parameters()},
+                {'params': self.model.glimpse_module.feature_extractor.layer4b.parameters()},
+                {'params': self.model.WW_module.parameters()},
+                {'params': self.model.posINF.parameters()},
+                {'params': self.model.peripheral_memory.parameters()},
+                {'params': self.model.foveal_memory.parameters()},
+                {'params': self.model.lookahead.parameters()},
+                {'params': self.model.querynet.parameters()},
+                {'params': self.model.classifier.parameters()}
+                ] 
         
         print('[*] Number of model parameters: {:,}'.format(
             sum([p.data.nelement() for p in self.model.parameters()])))
@@ -54,21 +67,21 @@ class Trainer(object):
                                                 step_size=10, gamma=0.5)
         
         # imagination, excludes foveal memory and classifier
-        self.imagination_optimizer = optim.SGD([
-                {'params': self.model.glimpse_module.parameters()},
-                {'params': self.model.WW_module.parameters()},
-                {'params': self.model.posINF.parameters()},
-                {'params': self.model.peripheral_memory.parameters()},
-#                {'params': self.model.foveal_memory.parameters()},
-                {'params': self.model.lookahead.parameters()}
-                ], lr=self.lr, momentum=0.9)
-        self.ilr_scheduler = lr_scheduler.StepLR(self.imagination_optimizer, 
-                                                 step_size=10, gamma=0.5)
+#        self.imagination_optimizer = optim.SGD([
+#                {'params': self.model.glimpse_module.parameters()},
+#                {'params': self.model.WW_module.parameters()},
+#                {'params': self.model.posINF.parameters()},
+#                {'params': self.model.peripheral_memory.parameters()},
+##                {'params': self.model.foveal_memory.parameters()},
+#                {'params': self.model.lookahead.parameters()}
+#                ], lr=self.lr, momentum=0.9)
+#        self.ilr_scheduler = lr_scheduler.StepLR(self.imagination_optimizer, 
+#                                                 step_size=10, gamma=0.5)
         
 #        self.optimizer = optim.AdamW(params, lr=5e-6, weight_decay = 1)
         
         #TODO scheduler hyperparams to config file?
-        self.gamma = 0.2
+        self.gamma = 7
         
         # set up logging
         if C.tensorboard:
@@ -180,7 +193,7 @@ class Trainer(object):
                                           p_target), dim=(2,3,4))
                 cos_what = 1 - wcos(p_target, 
                                     self.model.p_out[:,:-1,...]).mean(dim=(2,3))
-                self.model.fov_h = self.model.fov_h.detach()
+#                self.model.fov_h = self.model.fov_h
                 fov_h_deltas = self.model.fov_h[:,1:,...].flatten(2) - self.model.fov_h[:,:-1,...].flatten(2)
 #                fov_ph_deltas = self.model.fov_h[:,1:,...].flatten(2) - self.model.fov_ph[:,:-1,...].flatten(2) #WRONG!
                 fov_ph_deltas = self.model.fov_ph[:,:-1,...].flatten(2) - self.model.fov_h[:,:-1,...].flatten(2)
@@ -193,7 +206,7 @@ class Trainer(object):
 #                losses = losses + (self.gamma * total_APCloss,)
                 
                 # lookahead loss
-                total_lookahead = self.gamma * torch.mean(torch.sum(imaginary_cos, dim=1))
+                total_lookahead = self.gamma * torch.mean(torch.sum(loss_cos, dim=1))
 #                total_lookahead.backward(retain_graph=True) 
 #                self.imagination_optimizer.step()
 #                self.imagination_optimizer.zero_grad()
@@ -303,7 +316,7 @@ class Trainer(object):
 #                    losses = losses + (self.gamma * total_APCloss,)
 
                     # lookahead loss
-                    total_lookahead = self.gamma * torch.mean(torch.sum(imaginary_cos, dim=1))
+                    total_lookahead = self.gamma * torch.mean(torch.sum(loss_cos, dim=1))
 
                     # classification loss                    
                     losses = losses + (total_lookahead,)
