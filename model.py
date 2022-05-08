@@ -141,7 +141,138 @@ class Guide():
                     overlap_from[i,1].item(), overlap_to[i,1].item(), (1,))
             
         return R
-   
+
+class RAM_ch3(nn.Module):
+    """ RAM architecture to be used in chapter 3 experiments.
+    Features: FE, proprioception FE, FE merge, memory, RL trained location net,
+    classification net."""
+    def __init__(self, name, retina, FE, pro_FE, FE_merge, memory, loc_net, 
+                 classifier, baseliner, egocentric, hardcoded, gpu, 
+                 fixation_set = "MHL3"):
+        super(RAM_ch3, self).__init__()
+        # Config
+        self.name = name
+        self.hardcoded_locs = hardcoded
+        self.egocentric = egocentric
+        self.gpu = gpu
+        self.timesteps = 3
+        self.fixation_set = fixation_set
+        self.T = torch.tensor((500,500), device='cuda')
+        
+        # Separate seed for hardcoded fixations for reproducibility
+        with torch.random.fork_rng():
+            torch.manual_seed(303)
+            self.data_rng = torch.get_rng_state()
+        
+        # Sensor
+        self.retina = retina
+        
+        # FE
+        self.FE = FE
+        self.pro_FE = pro_FE #proprioception
+        self.FE_merge = FE_merge
+        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
+        
+        # Memory and downstream
+        self.memory = memory
+        self.classifier = classifier
+        self.loc_net = loc_net
+        self.baseliner = baseliner
+        
+        #choose the egocentric or exocentric coordinate frame
+        self.fixate = self.retina.foveate_ego if egocentric \
+                else self.retina.foveate_exo
+        self.frame = self.retina.to_egocentric if egocentric \
+                else self.retina.to_exocentric
+        
+    def set_timesteps(self, n):
+        self.timesteps = n
+
+    def reset(self, B=1):
+        """Initialize the hidden state and the location vectors at new batch."""
+        self.memory.reset(B)
+        self.retina.reset()
+        dtype = (torch.cuda.FloatTensor if self.gpu else torch.FloatTensor)
+        l_t = torch.Tensor(B,2).uniform_(-1, 1) #start at random location
+        l_t = Variable(l_t).type(dtype)
+
+        return l_t
+
+    def forward(self, x):
+        if self.hardcoded_locs:
+            y_locs = x[1]
+            x = x[0]
+            _ = self.reset(B=x.shape[0])
+            guide = Guide(self.timesteps, self.training, self.fixation_set,
+                          self.retina.width, rng_state = self.data_rng)
+            l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
+        else:
+            l_t_prev = self.reset(B=x.shape[0])
+        
+        #locs should store only coordinates
+        locs, log_pis, baselines, log_probas = [self.retina.to_exocentric(self.T, l_t_prev)], [], [], []
+        
+        # process minibatch
+        for t in range(self.timesteps):
+            # FE
+            patches = self.fixate(x, l_t_prev)
+            features = torch.cat([self.FE(patches[:,p]) for p in range(self.retina.k)], 1)
+            prop = self.pro_FE(l_t_prev) if t != 0 else torch.ones(features.shape,device='cuda')
+            g_t = self.FE_merge(features, prop)
+            g_t = self.avgpool(g_t).squeeze()
+            
+            # memory and downstream
+            h_t = self.memory(g_t)
+            log_pi, l_t = self.loc_net(h_t)
+            y_p = self.classifier(h_t)
+            b_t = self.baseliner(h_t)
+            
+            if self.hardcoded_locs:
+                if self.egocentric:
+                    l_t_prev = self.retina.to_egocentric_action(
+                        guide(y_locs, t+1) - self.retina.fixation) 
+                else:
+                    l_t_prev = self.retina.to_exocentric_action(self.T,
+                        guide(y_locs, t+1)) 
+            else: 
+                l_t_prev = l_t
+            
+            log_pis.append(log_pi)
+            log_probas.append(y_p)
+            locs.append(self.frame(self.T, l_t_prev))
+            baselines.append(b_t)
+            
+        # convert lists to tensors and reshape
+        baselines = torch.stack(baselines).transpose(1, 0)
+        log_pis = torch.stack(log_pis).transpose(1, 0)
+        log_probas = torch.stack(log_probas).transpose(1, 0)
+        locs = torch.stack(locs).transpose(1, 0)
+        
+        return log_probas, locs, log_pis, baselines
+    
+    def loss(self, log_probas, log_pis, baselines, y, locs, y_locs):
+        """ Copied over from RAM_baseline class"""
+        loss_classify = F.nll_loss(log_probas[:,-1,:], y)
+        if self.hardcoded_locs: 
+            return loss_classify, torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(0)
+        
+        # extract prediction
+        prediction = torch.max(log_probas[:,-1], 1)[1].detach()
+        
+        # compute reward
+        #TODO: cleanup baselines shape?
+        baselines = baselines.squeeze()
+        R = (prediction == y).float() 
+        R = R.unsqueeze(1).repeat(1, self.timesteps) 
+        adjusted_R = R - baselines.detach()
+        
+        # reinforce loss
+        loss_reinforce = torch.sum(-log_pis*adjusted_R, dim=1) #sum timesteps
+        loss_reinforce = torch.mean(loss_reinforce, dim=0) #avg batch
+        loss_baseline = F.mse_loss(baselines, R)
+        return loss_classify, loss_reinforce, loss_baseline, torch.mean(R.detach()), torch.mean(baselines.detach())
+        
+    
 class PAM(nn.Module):
     """ Predictive Attention Model
     See: 'Restructuring note' in Keep, October 2021."""
@@ -864,6 +995,10 @@ class FF_GlimpseModel(nn.Module):
         self.retina = retina
         self.glimpse_module = glimpse_module(retina, feature_extractor, avgpool=True)
         self.fc = nn.Linear(self.glimpse_module.out_shape.numel(), 200)
+        
+        with torch.random.fork_rng():
+            torch.manual_seed(303)
+            self.data_rng = torch.get_rng_state()
 
     def set_timesteps(self, n):
         self.timesteps = n

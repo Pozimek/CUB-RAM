@@ -31,10 +31,10 @@ from model import Guide, WW_RAM, RAM_baseline, FF_GlimpseModel
 from trainer import Trainer
 
 def main(config):
-    predictive_mem_test(config)
+#    predictive_mem_test(config)
 #    val(config)
 #    features(config)
-#    vis(config)
+    vis(config)
 
 def predictive_mem_test(config):
     """Hypothesis: foveal memory moves in a specific direction determined by the
@@ -436,7 +436,8 @@ class Tester(object):
         R = model.retina
         size = 37
         R.reset()
-        guide = Guide(model.timesteps, model.training, None, model.fixation_set)
+        guide = Guide(model.timesteps, model.training, model.fixation_set, R.width,
+                      rng_state=model.data_rng)
         l_t_prev = R.to_exocentric_action(model.T, guide(y_locs, 0))
         
         # Produce masked image
@@ -460,7 +461,8 @@ class Tester(object):
         
         # Extract and concatenate patches
         R.reset()
-        guide = Guide(model.timesteps, model.training, None, model.fixation_set)
+        guide = Guide(model.timesteps, model.training, model.fixation_set, R.width,
+                      rng_state=model.data_rng)
         l_t_prev = R.to_exocentric_action(model.T, guide(y_locs, 0))
         patches = []
         for t in range(model.timesteps):

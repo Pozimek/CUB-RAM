@@ -56,8 +56,7 @@ def main(config):
         config.retina.n_patches = 1
     
     # sensor
-    #forgot to include this:
-    clamp = config.vars.egocentric and not config.vars.hardcoded #XXX Forgot about this...
+    clamp = config.vars.egocentric and not config.vars.hardcoded #seed=1 didn't run this check and was always set to False
     if config.vars.sw_retina:
         retina = retinocortical_sensor(clamp = clamp)
     else:
@@ -85,18 +84,17 @@ def main(config):
     trainer.train()
     
 if __name__ == '__main__':
-    for seed in [1]:
+    for seed in [1,9,919]:
                         #ego,  prop,   hc, narrow, sw
-        for variant in [#[True, True, False, True, False],   #1a. ego prop RL
+        for variant in [#[True, True, False, True, False]#,   #1a. ego prop RL
                         #[False, True, False, True, False],  #1b. exo prop RL
                         #[True, True, True, True, False],    #1c. ego prop HC (testing ego prop_FE w/ good fixations)
                         #[False, True, True, True, False],   #1d. exo prop HC (testing exo prop_FE w/ good fixations)
-                        [True, False, False, False, False], #2a. ego wide RL
-                        [True, False, False, True, False],  #2b. ego narrow RL
-                        [True, False, True, False, False],  #2c. ego wide HC
-                        [True, False, True, True, False],   #2d. ego narrow HC
+                        #[True, False, False, False, False], #2a. ego wide RL
+                        #[True, False, False, True, False],  #2b. ego narrow RL
+                        #[True, False, True, False, False],  #2c. ego wide HC
+                        #[True, False, True, True, False]#,   #2d. ego narrow HC
                         [True, False, True, True, True]     #3. retina HC
-                        #TODO: DONT run more retina seeds.
                         ]: #run 2 more seeds after this is done
             config = get_ymlconfig('./3i_dispatch.yml')
             config.seed = seed

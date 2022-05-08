@@ -77,7 +77,7 @@ class RAM_sensor(object):
         raise NotImplementedError
         
     def foveate_exo(self, x, l, v=0):
-        """Sample using exocentric coordinates"""
+        """Sample using exocentric coordinate input"""
         B, C, H, W = x.shape
         T = torch.tensor([H,W]).float().cuda()
         coords = self.to_exocentric(T, l)
@@ -86,7 +86,7 @@ class RAM_sensor(object):
         return self._foveate(x, coords, v=v)
         
     def foveate_ego(self, x, l, v=0):
-        """Sample using egocentric coordinates"""
+        """Sample using egocentric coordinate input"""
         if self.fixation is None: #first fixation has to be exocentric
             return self.foveate_exo(x, l, v=v)
         B, C, H, W = x.shape
@@ -357,6 +357,39 @@ class ResNetEncoder(nn.Module):
     def forward(self, x):
         return self.resnet(x)
 
+class proprioceptive_FE(nn.Module):
+    def __init__(self, in_shape, out_shape, dummy):
+        super(proprioceptive_FE, self).__init__()
+        self.fc = nn.Linear(in_shape, out_shape.numel())
+        self.out_shape = out_shape
+        self.dummy = dummy
+#        self.ones = torch.ones(self.out_shape, device='cuda')
+    
+    def forward(self, x):
+        if not self.dummy:
+            return F.relu(self.fc(x)).reshape((x.shape[0],)+self.out_shape)
+        else:
+            return torch.ones((x.shape[0],)+self.out_shape, device='cuda')
+    
+class mult_merge(nn.Module):
+    def __init__(self, FE_shape, prop_shape, dummy):
+        super(mult_merge, self).__init__()
+        assert FE_shape == prop_shape
+        self.dummy = dummy
+        self.out_shape = FE_shape
+        
+    def forward(self, FE, prop):
+        return FE*prop if not self.dummy else FE
+        
+class FC_merge(nn.Module):
+    def __init__(self, FE_shape, prop_shape, dummy):
+        self.fc = nn.Linear(FE_shape.numel() + prop_shape.numel(), FE_shape)
+        self.dummy = dummy
+    
+    def forward(self, FE, prop):
+        x = F.relu(self.fc(torch.cat(FE, prop)))
+        return x if not self.dummy else FE
+        
 class VAR4Decoder(nn.Module):
     def __init__(self, in_shape, C = [128,64,32,16,8], BN = True,
                  activation = nn.ReLU(inplace=True)):
