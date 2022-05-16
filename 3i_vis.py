@@ -163,7 +163,7 @@ def vis_compare(var_names, var_labels, metrics, title, axes,
 ## 1 - Egocentric vs exocentric in RL
 variants = ['EGO1PROP1HC0NRW1RET0', 
             'EGO0PROP1HC0NRW1RET0']
-var_labels = ['Egocentric','Exocentric']
+var_labels = ['Egocentric (#8)','Exocentric (#1)']
 vis_compare(variants, var_labels,
             ['Train loss (smooth)', 'Val loss (smooth)'], 
              "Total losses of models using egocentric and exocentric \n coordinate frames", 
@@ -190,7 +190,7 @@ Likely due to not running enough seeds.
 variants = ['EGO1PROP1HC1NRW1RET0', 
             'EGO0PROP1HC1NRW1RET0', 
             'EGO1PROP0HC1NRW1RET0']
-var_labels = ['Egocentric','Exocentric', 'No prop, HC']
+var_labels = ['Egocentric (#9)','Exocentric (#2)', 'No proprioception (#6)']
 
 vis_compare(variants, var_labels,
             ['Train loss (smooth)', 'Val loss (smooth)'], 
@@ -216,7 +216,7 @@ that prop is reducing quality of FE likely by introducing noise.
 # Consider running no vision and prop-only variants to see if it can cheat
 variants = ['EGO1PROP0HC0NRW1RET0', 
             'EGO1PROP1HC0NRW1RET0']
-var_labels = ['No proprioception','Proprioception']
+var_labels = ['No proprioception (#4)','Proprioception (#8)']
 
 vis_compare(variants, var_labels,
             ['Train loss (smooth)', 'Val loss (smooth)'], 
@@ -243,7 +243,7 @@ the noise introduced by the prop modules (confounding effect).
 ## 4 - Narrow vs wide in RL
 variants = ['EGO1PROP0HC0NRW1RET0', 
             'EGO1PROP0HC0NRW0RET0']
-var_labels = ['Narrow FOV','Wide FOV']
+var_labels = ['Foveated Patches (#4)', 'Large Patch (#3)']
 
 vis_compare(variants, var_labels,
             ['Train loss (smooth)', 'Val loss (smooth)'], 
@@ -267,7 +267,7 @@ model is overconfident and not well-calibrated.
 variants = ['EGO1PROP0HC1NRW1RET0', 
             'EGO1PROP0HC1NRW0RET0', 
             'EGO1PROP0HC1NRW1RET1']
-var_labels = ['Narrow FOV','Wide FOV', 'Software Retina']
+var_labels = ['Foveated Patches (#6)', 'Large Patch (#5)', 'Software Retina (#7)']
 
 vis_compare(variants, var_labels,
             ['Train loss (smooth)', 'Val loss (smooth)'], 
@@ -292,7 +292,7 @@ The software retina performed worse than either of the patch sensors in spite
 of having the widest fov. This result combined with its slow performance 
 (13h42m28s for 88 epochs) is further reason to drop it.
 """
-
+    
 """
 - sw retina - nodes: 16384 , fov:372, out shape: (3,273,500)
 - single patch sensor width: 224 (DT-RAM)
