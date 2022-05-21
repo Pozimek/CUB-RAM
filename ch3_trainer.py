@@ -161,7 +161,7 @@ class Trainer(object):
                                          locs, y_locs)
 
                 # classification loss
-                total_loss = sum(losses[:3])
+                total_loss = sum(losses[:3]) if type(losses) is tuple else losses
                 total_loss.backward()
                 self.optimizer.step()
                 self.optimizer.zero_grad()
@@ -186,11 +186,12 @@ class Trainer(object):
                         "Train_loss":loss_t.val}, iteration)
                     self.writer.add_scalars('Accuracy (Detailed)/Training', {
                         "Train_acc":accs.val}, iteration)
-                    self.writer.add_scalars('Partial Losses/Training',{
-                            "Reward_train" : R.val,
-                            "Baseline_train" : B.val,
-                            "Base_Loss_train" : loss_base.val,
-                            "Class_Loss_train" : loss_class.val}, iteration)
+                    if type(losses) is tuple:
+                        self.writer.add_scalars('Partial Losses/Training',{
+                                "Reward_train" : R.val,
+                                "Baseline_train" : B.val,
+                                "Base_Loss_train" : loss_base.val,
+                                "Class_Loss_train" : loss_class.val}, iteration)
                     
                 # update status bar
                 toc = time.time()
@@ -251,11 +252,12 @@ class Trainer(object):
                         "Val_loss":loss_t.val}, iteration)
                     self.writer.add_scalars('Accuracy (Detailed)/Training', {
                         "Val_acc":accs.val}, iteration)
-                    self.writer.add_scalars('Partial Losses/Training',{
-                            "Reward_val" : R.val,
-                            "Baseline_val" : B.val,
-                            "Base_Loss_val" : loss_base.val,
-                            "Class_Loss_val" : loss_class.val}, iteration)
+                    if type(losses) is tuple:
+                        self.writer.add_scalars('Partial Losses/Training',{
+                                "Reward_val" : R.val,
+                                "Baseline_val" : B.val,
+                                "Base_Loss_val" : loss_base.val,
+                                "Class_Loss_val" : loss_class.val}, iteration)
 
         print("Val epoch {} - avg acc: {:.2f} | avg loss: {:.3f}".format(
                 epoch, accs.avg, loss_t.avg))

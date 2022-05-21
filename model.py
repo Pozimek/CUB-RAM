@@ -142,6 +142,262 @@ class Guide():
             
         return R
 
+class ff_aggregator_ch4(nn.Module):
+    """ A feedforward model using a feature extractor (eg ResNet18) to classify
+    a number of image observations processed by a RAM_sensor. The different
+    observations are aggregated using different strategies:
+        1. Imagespace aggregation using masking: occlude all of the input image
+        and gradually uncover it with each observation. Preserves all relevant
+        information.
+        2. Imagespace aggregation using spatial concatenation of observed image
+        patches. Relative spatial information is lost. Q: shuffle order?
+        3. Featurespace aggregation using averaging of feature vectors after 
+        passing image patches sequentially. Relative spatial information is 
+        lost alongside imagespace patch differentiation. Order-invariant.
+        4. Output aggregation using averaging of softmax outputs after passing
+        image patches sequentially. Relative confidences and spatial information
+        is lost, order invariant. Ensemble.
+        5. Output aggregation using averaging of classifier pre-softmax outputs
+        after passing image patches sequentially. Spatial information is lost,
+        order invariant. Ensemble.
+    """
+    def __init__(self, name, retina, feature_extractor, avgpool=False, 
+                 strategy=4, gpu=True, fixation_set = "MHL3"):
+        super(ff_aggregator_ch4, self).__init__()
+        self.hardcoded_locs = True
+        self.require_locs = True
+        self.fixation_set = fixation_set
+        self.name = name
+        self.T = torch.tensor((500,500)).cuda() #image shape
+        self.gpu = gpu
+        self.timesteps = 1
+        self.zero = torch.tensor([0], device='cuda')
+        
+        # Which of the 5 aggregation strategies to employ
+        self.strategy = strategy 
+        
+        self.retina = retina
+#        self.glimpse_module = glimpse_module(retina, feature_extractor, avgpool=True)
+        self.avgpool = nn.AdaptiveAvgPool2d((1,1)) if avgpool else False
+        self.FE = feature_extractor
+        
+        fc_in = self.FE.out_shape[0] if avgpool else self.FE.out_shape.numel()
+        self.fc = nn.Linear(fc_in, 200)
+        
+        with torch.random.fork_rng():
+            torch.manual_seed(303)
+            self.data_rng = torch.get_rng_state()
+
+    def set_timesteps(self, n):
+        self.timesteps = n
+        
+    def forward(self, x):
+        self.retina.reset()
+        if self.retina.k != 1 and (self.strategy == 1 or self.strategy == 2):
+                raise Exception("Imagespace aggregation currently does not \
+                                support multi-patch retina.")
+        if self.strategy == 1:
+            return self.mask_aggregation(x[0], x[1])
+        elif self.strategy == 2:
+            return self.spatial_concatenation(x[0], x[1])
+        elif self.strategy == 3:
+            return self.feature_averaging(x[0], x[1])
+        elif self.strategy == 4:
+            return self.softmax_averaging(x[0], x[1])
+        elif self.strategy == 5:
+            return self.presoftmax_averaging(x[0], x[1])
+      
+    def loss(self, *args):
+        """Computes negative log likelihood classification loss"""
+        log_probas, _, _, y, _, _ = args
+        return F.nll_loss(log_probas[:,-1,:], y)
+    
+    def mask_aggregation(self, x, y_locs):
+        """Strategy 1"""
+        # First fixation
+        if self.gpu: x = x.cuda()
+        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
+        locs = [l_t_prev]
+        
+        size = self.retina.g
+        masks = torch.zeros_like(x)
+        B, C, H, W = x.shape
+        
+        # process image to compute masks
+        for t in range(self.timesteps):
+            if self.retina.fixation is None: #first fixation has to be exocentric
+                coords = self.retina.to_exocentric(self.T, l_t_prev)
+            else: coords = self.retina.to_egocentric(self.T, l_t_prev)
+            self.retina.fixation = coords
+            
+            # Patch corners
+            from_x, from_y = coords[:, 1] - (size // 2), coords[:, 0] - (size // 2)
+            to_x, to_y = from_x + size, from_y + size
+            # Clamp
+            from_x = torch.max(self.zero, from_x)
+            from_y = torch.max(self.zero, from_y)
+            to_y = torch.min(self.T[0], to_y)
+            to_x = torch.min(self.T[1], to_x)
+            
+            for b in range(B):
+                masks[b, :, from_y[b]:to_y[b], from_x[b]:to_x[b]] = 1
+            
+            # Get and store next fixation
+            l_t_prev = self.retina.to_egocentric_action(
+                    guide(y_locs, t+1) - self.retina.fixation)
+            locs.append(l_t_prev)
+        
+        # Apply masks
+        x = x * masks
+        log_probas = self.imagespace_aggregate(x)
+        
+        # convert list to tensors and reshape
+        locs = torch.stack(locs).transpose(1, 0)
+        
+        return log_probas, locs, torch.Tensor(0), torch.Tensor(0)
+    
+    def spatial_concatenation(self, x, y_locs):
+        """Strategy 2"""
+        # First fixation
+        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
+        locs = [l_t_prev]
+        
+        patches = []
+        
+        # process image to extract patches
+        for t in range(self.timesteps):
+            # Extract patch
+            phi = self.retina.foveate_ego(x, l_t_prev)
+            patches.append(phi)
+
+            # Get and store next fixation
+            l_t_prev = self.retina.to_egocentric_action(
+                    guide(y_locs, t+1) - self.retina.fixation) 
+            locs.append(l_t_prev)
+        
+        # Produce and classify concatenation
+        concat = torch.cat(patches, dim=4).squeeze()
+        log_probas = self.imagespace_aggregate(concat)
+        
+        # convert list to tensors and reshape
+        locs = torch.stack(locs).transpose(1, 0)
+        
+        return log_probas, locs, torch.Tensor(0), torch.Tensor(0)
+    
+    def imagespace_aggregate(self, x):
+        """Feedforward pass shared between imagespace aggregation strategies
+        (1 and 2)"""
+        features = self.FE(x)
+        
+        #avgpooling sparse feature matrices can produce a very low magnitude
+        #feature vector, might be worth applying BN to fix them. 
+        if self.avgpool: 
+#            if self.strategy == 1: features = 100*features
+            features = self.avgpool(features)
+        
+        log_probas = [F.log_softmax(self.fc(features.squeeze()), dim=1)]
+        log_probas = torch.stack(log_probas).transpose(1, 0)
+        
+        return log_probas
+    
+    def feature_averaging(self, x, y_locs):
+        """Strategy 3"""
+        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
+        locs, g = [l_t_prev], []
+        
+        # process image
+        for t in range(self.timesteps):
+            # Extract features
+            patches = self.retina.foveate_ego(x, l_t_prev)
+            g_t = self.FE(patches)
+            
+            # Combine patches
+#            g_t = torch.mean(torch.cat(g_t, dim=2),dim=2).squeeze()
+            
+            # Get next fixation
+            l_t_prev = self.retina.to_egocentric_action(
+                    guide(y_locs, t+1) - self.retina.fixation)
+                
+            # Store tensors
+            locs.append(l_t_prev)
+            g.append(g_t)
+        
+        # Average feature tensors
+        g = torch.mean(torch.stack(g, dim=1),dim=1)
+        
+        if self.avgpool:
+            g = self.avgpool(g)
+        
+        # Classify
+        log_probas = [F.log_softmax(self.fc(g), dim=1)]
+        
+        # convert list to tensors and reshape
+        log_probas = torch.stack(log_probas).transpose(1, 0)
+        locs = torch.stack(locs).transpose(1, 0)
+        
+        return log_probas, locs, torch.Tensor(0), torch.Tensor(0)
+    
+    def output_aggregate(self, x, y_locs):
+        """Feedforward pass shared between output aggregation strategies 
+        (4 and 5)"""
+        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
+        locs, log_probas = [l_t_prev], []
+        
+        # process image
+        for t in range(self.timesteps):
+            # Extract features
+            patches = self.retina.foveate_ego(x, l_t_prev)
+            g_t = self.FE(patches)
+            
+            # Combine patches
+#            g_t = torch.mean(torch.cat(g_t, dim=2),dim=2).squeeze()
+            
+            if self.avgpool: 
+                g_t = self.avgpool(g_t)
+            
+            # Classify
+            y_p = self.fc(g_t)
+
+            # Get next fixation
+            l_t_prev = self.retina.to_egocentric_action(
+                    guide(y_locs, t+1) - self.retina.fixation)
+                
+            # store tensors
+            locs.append(l_t_prev)
+            log_probas.append(y_p)
+        
+        # convert list to tensors and reshape
+        log_probas = torch.stack(log_probas).transpose(1, 0)
+        locs = torch.stack(locs).transpose(1, 0)
+        return log_probas, locs
+    
+    def softmax_averaging(self, x, y_locs):
+        """Strategy 4"""
+        log_probas, locs = self.output_aggregate(x, y_locs)
+        log_probas = [F.log_softmax(i, dim=1) for i in log_probas]
+        
+        # Compute final classification output
+        averaged_softmax = torch.mean(log_probas, dim=1)
+        log_probas[:,-1,:] = averaged_softmax
+        
+        return log_probas, locs, torch.Tensor(0), torch.Tensor(0)
+    
+    def presoftmax_averaging(self, x, y_locs):
+        """Strategy 5"""
+        log_probas, locs = self.output_aggregate(x, y_locs)
+        
+        # Compute final classification output
+        averaged_presoftmax = torch.mean(log_probas, dim=1)
+        log_probas[:,-1,:] = F.log_softmax(averaged_presoftmax, dim=1)
+#        for t in range(self.timesteps):
+#            log_probas[:,t,:] = F.log_softmax(log_probas[:,t,:], dim=1)
+        
+        return log_probas, locs, torch.Tensor(0), torch.Tensor(0)
+
 class RAM_ch3(nn.Module):
     """ RAM architecture to be used in chapter 3 experiments.
     Features: FE, proprioception FE, FE merge, memory, RL trained location net,
@@ -968,8 +1224,8 @@ class FF_GlimpseModel(nn.Module):
         2. Imagespace aggregation using spatial concatenation of observed image
         patches. Relative spatial information is lost. Q: shuffle order?
         3. Featurespace aggregation using averaging of feature vectors after 
-        passing image patches sequentially. Relative spatial information is lost
-        alongside imagespace patch differentiation. Order-invariant. Ensemble.
+        passing image patches sequentially. Relative spatial information is 
+        lost alongside imagespace patch differentiation. Order-invariant.
         4. Output aggregation using averaging of softmax outputs after passing
         image patches sequentially. Relative confidences and spatial information
         is lost, order invariant. Ensemble.

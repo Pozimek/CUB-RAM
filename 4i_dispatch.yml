@@ -1,0 +1,26 @@
+name: ch4
+comment: ''
+tensorboard: True
+log_dir: ./logs/
+ckpt_dir: ./ckpt/
+seed: 9001
+gpu: True
+rgb: True
+num_workers: 4
+batch_size: 16
+training:
+  epochs: 100
+  init_lr: 5.0e-3
+  es: True
+  delta: 0.5
+  patience: 40
+  best: True
+  resume: False
+retina:
+  foveal_size: 37     
+  n_patches: 1
+  scaling: 10  #scale of successive patches
+  std: 0.05
+vars: #experimental variables
+  fixloc: 0
+  strategy: 2

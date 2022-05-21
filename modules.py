@@ -336,11 +336,12 @@ class crude_retina(RAM_sensor):
         return False
 
 class ResNetEncoder(nn.Module):
+    """ A wrapper for building ResNet18 while easily modifying its architectural
+    aspects. Comment lines appropriately to control strides."""
     def __init__(self, in_shape, blocks = 4, pretrained = True, maxpool = True,
                  stride = True):
         super(ResNetEncoder, self).__init__()
         resnet = list(resnet18(pretrained = pretrained).children())
-#        resnet = _resnet('resnet18', BasicBlock, [2, 2, 2, 2], pretrained, False)
         if not maxpool: del resnet[3]
         if not stride:
 #            resnet[0].stride = (1,1)

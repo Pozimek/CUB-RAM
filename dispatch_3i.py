@@ -3,8 +3,7 @@
 """
 Created on Wed Apr 13 00:08:30 2022
 
-Chapter 3 dispatch script for the egocentric vs exocentric coordinate frame
-experiment (vs no proprioception in both).
+Chapter 3 (Lit review and framework. ch2 in latex) experiment dispatch script.
 
 @author: piotr
 """
