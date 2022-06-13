@@ -18,7 +18,7 @@ training:
   resume: False
 retina:
   foveal_size: 37     
-  n_patches: 1
+  n_patches: 2
   scaling: 10  #scale of successive patches
   std: 0.05
 vars: #experimental variables

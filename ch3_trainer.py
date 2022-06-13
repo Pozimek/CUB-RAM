@@ -229,14 +229,13 @@ class Trainer(object):
                 losses = self.model.loss(log_probas, log_pi, baselines, y, locs, y_locs)
                 
                 # classification loss                    
-                total_loss = sum(losses[:3])
+                total_loss = sum(losses[:3]) if type(losses) is tuple else losses
                 
                 # compute accuracy
                 correct = torch.max(log_probas[:,-1], 1)[1].detach() == y
                 acc = 100 * (correct.sum().item() / self.batch_size)
                 
                 # update meters
-                #These are averaged, so no need to change anything
                 if type(losses) is tuple:
                     loss_class.update(losses[0].item(), self.batch_size)
                     R.update(losses[3].item(), self.batch_size) 
@@ -275,15 +274,17 @@ class Trainer(object):
             filename = self.C.name + '_best.pth.tar'
             shutil.copyfile(ckpt_path, os.path.join(self.C.ckpt_dir, filename))
             
-    def load_checkpoint(self, best=False):
+    def load_checkpoint(self, name = None, best=False):
         """
         Args:
         - best: if True loads the best model, otherwise the most recent one.
         """
         print("[*] Loading model from {}".format(self.C.ckpt_dir))
-
-        filename = self.model_name + '_ckpt.pth.tar'
-        if best: filename = self.model_name + '_best.pth.tar'
+        
+        if name == None: name = self.C.name
+        
+        filename = name + '_ckpt.pth.tar'
+        if best: filename = name + '_best.pth.tar'
         
         ckpt_path = os.path.join(self.C.ckpt_dir, filename)
         ckpt = torch.load(ckpt_path)

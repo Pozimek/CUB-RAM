@@ -5,7 +5,7 @@ Created on Sat May 21 01:31:24 2022
 
 Chapter 4 (active vision memory, ch3 in latex) experiment dispatch script.
 
-Experiment 0: evaluating 5 selected fixation locations.
+Experiment 1: evaluating 5 selected fixation locations.
 
 @author: piotr
 """

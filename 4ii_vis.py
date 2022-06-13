@@ -25,15 +25,9 @@ import seaborn as sns
 config = get_ymlconfig('./4ii_dispatch.yml')
 parsed = {}
 
-
-                             ### WIP ###
-                             # Visualize plots
-                             # Visualize some aggregation strats
-                             
-                             
-for fixloc in range(5):
+for strategy in range(1,6):
     V = {}
-    var = "FIXLOC{}".format(fixloc)
+    var = "STRAT{}".format(strategy)
     
     for seed in [1, 9, 919]:
         name = "ch4ii-s{}".format(seed)
@@ -53,7 +47,6 @@ for fixloc in range(5):
         V[seed] = S
     parsed[var] = V
        
-    
 ## Renaming tables
     
 TAGS = {'Accuracy (Detailed)_Training_Train_acc':       'Train acc (sharp)',
@@ -76,14 +69,11 @@ TAGS = {'Accuracy (Detailed)_Training_Train_acc':       'Train acc (sharp)',
         'Smoothed Results_Time_Time_elapsed':           'Time elapsed'
         }
 
-PARTS = ["Left Eye", "Left Leg", "Breast", "Beak", "Tail"]
-
-#apply table
+#apply TAGS table
 for variant in parsed.keys():
     for seed in parsed[variant].keys():
         for T in TAGS.keys():
             parsed[variant][seed][TAGS[T]] = parsed[variant][seed].pop(T)
-
 
 ## Compute mean and std where applicable 
 
@@ -112,14 +102,18 @@ for variant in parsed.keys():
     STATS[variant] = V
 
 # Save
-#fname = 'stats_ch4i.npy'
+#fname = 'stats_ch4ii.npy'
 #np.save(fname,STATS)
 #STATS = np.load(fname, allow_pickle=True)[()]
+
+                 ### WIP ###
+                 # Visualize plots
+                 # Get peak val accs
 
 ## Visualize
 def vis_compare(var_names, var_labels, metrics, title, axes, 
                 metric_labels = ['Training', 'Validation'], title_size=15, 
-                size = (8,5), v=False):
+                size = (8,5), v=False, y_lim = None):
     """ Visualize multiple variants' metrics on a single plot"""
     sns.set_style('darkgrid') #darkgrid, whitegrid, dark, white, and ticks
     sns.set_context("notebook") #paper talk poster notebook
@@ -128,6 +122,9 @@ def vis_compare(var_names, var_labels, metrics, title, axes,
     plt.title(title, fontsize = title_size, wrap=True)
     plt.xlabel(axes[0])
     plt.ylabel(axes[1])
+    
+    if y_lim is not None:
+        plt.ylim([y_lim[0], y_lim[1]])
     
     for i, variant in enumerate(var_names):
         for j, metric in enumerate(metrics):
@@ -148,20 +145,22 @@ def vis_compare(var_names, var_labels, metrics, title, axes,
     plt.show()
     
 
-### 1 - All five fixlocs, train/val all on one plot.
-fixlocs = ['FIXLOC{}'.format(i) for i in range(5)]
-loc_labels = PARTS
-vis_compare(fixlocs, loc_labels,
+### 1 - All strategies, train/val all on one plot.
+strats = ['STRAT{}'.format(i) for i in range(1,6)]
+STRATS = ["Unmasking", "Spatial Concatenation", "Feature Averaging", 
+          "Output (softmax) Averaging", "Output (pre-softmax) Averaging"]
+loc_labels = STRATS
+vis_compare(strats, loc_labels,
             ['Train loss (smooth)', 'Val loss (smooth)'],
-            "Total losses obtained by ResNet18 with different \n fixation locations",
-            ["Epoch","Loss"])
+            "Losses obtained by a ResNet18 utilizing different \n aggregation strategies",
+            ["Epoch","Loss"], y_lim=[-0.5,14])
 
-vis_compare(fixlocs, loc_labels,
+vis_compare(strats, loc_labels,
             ['Train acc (smooth)', 'Val acc (smooth)'],
-            "Accuracies obtained by ResNet18 with different \n fixation locations",
+            "Accuracies obtained by a ResNet18 utilizing different \n aggregation strategies",
             ["Epoch","Accuracy (%)"])
 
 #max mean acc
-for i, part in enumerate(fixlocs):
+for i, part in enumerate(strats):
     u = STATS[part]['Val acc (smooth)']['u']
     print(loc_labels[i], u.max())

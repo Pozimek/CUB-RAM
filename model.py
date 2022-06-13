@@ -16,7 +16,7 @@ from torch.autograd import Variable
 from utils import conv_outshape, ir, out_shape
 
 from modules import crude_retina, glimpse_module
-from modules import ConvLSTM, ActiveConvLSTM, FC_RNN
+from modules import ConvLSTM, ActiveConvLSTM
 from modules import classification_network, location_network, baseline_network
 from modules import classification_network_short, WhereMix_classifier, accumulative_classifier
 from modules import RAM_sensor, bnlstm, laRNN
@@ -50,7 +50,8 @@ class Guide():
         elif type(self.mode) is list: self.order = self.mode
         else: raise Exception("No such guide mode")
         if training: 
-            if train_all: #make all fixations available during training via shuffle
+            if train_all: 
+                #make all fixations available during training via shuffle
                 self.shuffle(self.order)
             else: #shuffle only those fixations available at T
                 Tset = self.order[:T+1] 
@@ -142,6 +143,106 @@ class Guide():
             
         return R
 
+
+class RAM_ch4(nn.Module):
+    """ RAM architecture variants used in chapter 4 experiments.
+    Supports WW. Location net is disabled."""
+    def __init__(self, name, retina, FE, WWfov, WWper, memory, classifier, gpu,
+                 fixation_set = "MHL3"):
+        super(RAM_ch4, self).__init__()
+        # Config
+        self.name = name
+        self.hardcoded_locs = True
+        self.egocentric = True
+        self.gpu = gpu
+        self.timesteps = 3 #MHL3 default
+        self.fixation_set = fixation_set
+        self.T = torch.tensor((500,500), device='cuda')
+        
+        # Separate seed for hardcoded fixations reproducibility
+        with torch.random.fork_rng():
+            torch.manual_seed(303)
+            self.data_rng = torch.get_rng_state()
+        
+        # Sensor
+        self.retina = retina
+        
+        # Feature extractor
+        self.FE = FE
+        
+        # WhatWhere
+        self.WWmodule_fov = WWfov #or nn.AdaptiveAvgPool2d((1,1))
+        self.WWmodule_per = WWper
+        
+        # Memory and downstream
+        self.memory = memory
+        self.classifier = classifier
+        
+        #choose the egocentric or exocentric coordinate frame
+        self.fixate = self.retina.foveate_ego
+        self.frame = self.retina.to_egocentric
+        
+    def set_timesteps(self, n):
+        self.timesteps = n
+
+    def reset(self, B=1):
+        """Initialize the hidden state and location vectors at new batch."""
+        self.memory.reset(B)
+        self.retina.reset()
+        dtype = (torch.cuda.FloatTensor if self.gpu else torch.FloatTensor)
+        l_t = torch.Tensor(B,2).uniform_(-1, 1) #start at random location
+        l_t = Variable(l_t).type(dtype)
+
+        return l_t
+
+    def forward(self, x):
+        y_locs = x[1]
+        x = x[0]
+        _ = self.reset(B=x.shape[0])
+        guide = Guide(self.timesteps, self.training, self.fixation_set,
+                      self.retina.width, rng_state = self.data_rng)
+        l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
+        
+        #locs should store only coordinates
+        locs, log_pis, baselines, log_probas = [l_t_prev], [], [], []
+        
+        # process minibatch
+        for t in range(self.timesteps):
+            # FE
+            patches = self.fixate(x, l_t_prev)
+            features = torch.stack(
+                    [self.FE(patches[:,p]) for p in range(self.retina.k)])
+            
+            # WW
+            WWfov = self.WWmodule_fov(features[0])
+            WWper = self.WWmodule_per(features[1])
+            WW = torch.cat([WWfov,WWper], 2)
+            if len(WW.shape) > 3: WW = WW.flatten(1,-1) #not WW memory format
+            
+            # memory and downstream
+            h_t = self.memory(WW)
+            h_flat = h_t.flatten(1,-1)
+            y_p = self.classifier(h_flat)
+            
+            l_t_prev = self.retina.to_egocentric_action(
+                guide(y_locs, t+1) - self.retina.fixation)
+            
+            log_probas.append(y_p)
+            locs.append(self.frame(self.T, l_t_prev))
+            
+        # convert lists to tensors and reshape
+        log_probas = torch.stack(log_probas).transpose(1, 0)
+        locs = torch.stack(locs).transpose(1, 0)
+        
+        return log_probas, locs, log_pis, baselines
+    
+    def loss(self, log_probas, log_pis, baselines, y, locs, y_locs):
+        """ Copied over from RAM_baseline class"""
+        loss_classify = F.nll_loss(log_probas[:,-1,:], y)
+        
+        return loss_classify, torch.tensor(0), torch.tensor(0), torch.tensor(0), torch.tensor(0)
+
+
 class ff_aggregator_ch4(nn.Module):
     """ A feedforward model using a feature extractor (eg ResNet18) to classify
     a number of image observations processed by a RAM_sensor. The different
@@ -216,7 +317,8 @@ class ff_aggregator_ch4(nn.Module):
         """Strategy 1"""
         # First fixation
         if self.gpu: x = x.cuda()
-        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        guide = Guide(self.timesteps, self.training, self.fixation_set, 
+                      self.retina.width, rng_state = self.data_rng)
         l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
         locs = [l_t_prev]
         
@@ -260,7 +362,8 @@ class ff_aggregator_ch4(nn.Module):
     def spatial_concatenation(self, x, y_locs):
         """Strategy 2"""
         # First fixation
-        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        guide = Guide(self.timesteps, self.training, self.fixation_set, 
+                      self.retina.width, rng_state = self.data_rng)
         l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
         locs = [l_t_prev]
         
@@ -304,7 +407,8 @@ class ff_aggregator_ch4(nn.Module):
     
     def feature_averaging(self, x, y_locs):
         """Strategy 3"""
-        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        guide = Guide(self.timesteps, self.training, self.fixation_set, 
+                      self.retina.width, rng_state = self.data_rng)
         l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
         locs, g = [l_t_prev], []
         
@@ -312,7 +416,7 @@ class ff_aggregator_ch4(nn.Module):
         for t in range(self.timesteps):
             # Extract features
             patches = self.retina.foveate_ego(x, l_t_prev)
-            g_t = self.FE(patches)
+            g_t = self.FE(patches.squeeze(1))
             
             # Combine patches
 #            g_t = torch.mean(torch.cat(g_t, dim=2),dim=2).squeeze()
@@ -329,7 +433,7 @@ class ff_aggregator_ch4(nn.Module):
         g = torch.mean(torch.stack(g, dim=1),dim=1)
         
         if self.avgpool:
-            g = self.avgpool(g)
+            g = self.avgpool(g).squeeze()
         
         # Classify
         log_probas = [F.log_softmax(self.fc(g), dim=1)]
@@ -343,7 +447,8 @@ class ff_aggregator_ch4(nn.Module):
     def output_aggregate(self, x, y_locs):
         """Feedforward pass shared between output aggregation strategies 
         (4 and 5)"""
-        guide = Guide(self.timesteps, self.training, self.fixation_set)
+        guide = Guide(self.timesteps, self.training, self.fixation_set, 
+                      self.retina.width, rng_state = self.data_rng)
         l_t_prev = self.retina.to_exocentric_action(self.T, guide(y_locs, 0))
         locs, log_probas = [l_t_prev], []
         
@@ -351,13 +456,13 @@ class ff_aggregator_ch4(nn.Module):
         for t in range(self.timesteps):
             # Extract features
             patches = self.retina.foveate_ego(x, l_t_prev)
-            g_t = self.FE(patches)
+            g_t = self.FE(patches.squeeze())
             
             # Combine patches
 #            g_t = torch.mean(torch.cat(g_t, dim=2),dim=2).squeeze()
             
             if self.avgpool: 
-                g_t = self.avgpool(g_t)
+                g_t = self.avgpool(g_t).squeeze()
             
             # Classify
             y_p = self.fc(g_t)
@@ -378,13 +483,12 @@ class ff_aggregator_ch4(nn.Module):
     def softmax_averaging(self, x, y_locs):
         """Strategy 4"""
         log_probas, locs = self.output_aggregate(x, y_locs)
-        log_probas = [F.log_softmax(i, dim=1) for i in log_probas]
+        log_probas = F.log_softmax(log_probas, dim=2)
         
         # Compute final classification output
-        averaged_softmax = torch.mean(log_probas, dim=1)
-        log_probas[:,-1,:] = averaged_softmax
+        averaged_softmax = torch.mean(log_probas, dim=1).unsqueeze(1)
         
-        return log_probas, locs, torch.Tensor(0), torch.Tensor(0)
+        return averaged_softmax, locs, torch.Tensor(0), torch.Tensor(0)
     
     def presoftmax_averaging(self, x, y_locs):
         """Strategy 5"""
@@ -397,6 +501,7 @@ class ff_aggregator_ch4(nn.Module):
 #            log_probas[:,t,:] = F.log_softmax(log_probas[:,t,:], dim=1)
         
         return log_probas, locs, torch.Tensor(0), torch.Tensor(0)
+
 
 class RAM_ch3(nn.Module):
     """ RAM architecture to be used in chapter 3 experiments.

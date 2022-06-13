@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon May 30 01:48:39 2022
+Created on Sun Jun 12 23:36:56 2022
 
-Chapter 4 (active vision memory, ch3 in latex) experiment dispatch script.
+Chapter 4 (active vision memory, ch3 in latex) evaluation script.
 
 Experiment 2: evaluating different recurrent memory variants.
 WW_LSTM vs WW_RNN vs LSTM vs RNN
 
-Script trains all models on 3 timesteps. 4iii_eval.py evaluates them
-appropriately.
-
-Notes:
-- More justice: varying where_dim
-- Old WW stuff catted fovper along what_dim, now you're doing where_dim
+Script evaluates all variants at every timestep.
 
 Result: training memory with T=3 and evaluating at T=1,2,3 was a mistake, and
 so the results from this script were not used in the dissertation in their 
@@ -95,16 +90,25 @@ def main(config):
     model = RAM_ch4(config.name, retina, FE, WWfov, WWper, memory, classifier,
                     gpu=True)
     
+    # change config name to avoid overwriting old logs
+    load_name = config.name
+    config.name += "T{}".format(config.vars.timesteps)
+    model.set_timesteps(config.vars.timesteps)
+    
     trainer = Trainer(config, loader, model)
-    trainer.train()
+    trainer.load_checkpoint(name = load_name, best=True)
+    
+    trainer.validate(0)
     
 if __name__ == '__main__':
     for seed in [1,9,919]:
         for variant in range(4):
-            config = get_ymlconfig('./4iii_dispatch.yml')
-            config.seed = seed
-            # 0:WW_LSTM, 1:WW_RNN, 2:LSTM 3:RNN
-            config.vars.variant = variant
-            
-#            config.training.resume = True
-            main(config)
+            for timesteps in [1,2,3]:
+                config = get_ymlconfig('./4iii_dispatch.yml')
+                config.seed = seed
+                # 0:WW_LSTM, 1:WW_RNN, 2:LSTM 3:RNN
+                config.vars.variant = variant
+                config.vars.timesteps = timesteps
+                
+    #            config.training.resume = True
+                main(config)

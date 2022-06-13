@@ -1399,7 +1399,8 @@ class WW_LSTM(nn.Module):
     """
     A simple WW_LSTMCell handler that allows choosing the mixing op.
     """
-    def __init__(self, in_shape, hidden_what, hidden_where, gate_op = WWMix, in_op = WWMix):
+    def __init__(self, in_shape, hidden_what, hidden_where, gate_op = WWMix, 
+                 in_op = WWMix):
         super(WW_LSTM, self).__init__()
         self.core = WW_LSTMCell(in_shape, hidden_what, hidden_where, gate_op = gate_op, in_op = in_op)
         self.hidden_size = self.core.out_shape
@@ -1807,9 +1808,35 @@ class ActiveConvLSTM(nn.Module):
 #ENDOF Active ConvLSTM
 ######
 
-class FC_RNN(nn.Module):
+#class FC_RNN(nn.Module):
+#    def __init__(self, input_size, hidden_size):
+#        super(FC_RNN, self).__init__()
+#        self.input_size = input_size
+#        self.hidden_size = hidden_size
+#        self.hidden_state = None
+#
+#        self.fc_in = nn.Linear(input_size, hidden_size)
+#        self.fc_h = nn.Linear(hidden_size, hidden_size)
+#        
+#    def reset(self, batch_size):
+#        self.hidden_state = None
+#
+#    def forward(self, x):
+#        B, L = x.shape
+#        if self.hidden_state == None:
+#            h_t_prev = Variable(torch.zeros(B, self.hidden_size)).cuda()
+#            
+#        h1 = self.fc_in(x)
+#        h2 = self.fc_h(h_t_prev)
+#        h_t = F.relu(h1 + h2)
+#        h_t_prev = h_t        
+#        
+#        return h_t
+
+class vanilla_rnn(nn.Module):
+    """ Elman RNN (?)"""
     def __init__(self, input_size, hidden_size):
-        super(FC_RNN, self).__init__()
+        super(vanilla_rnn, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.hidden_state = None
@@ -1823,14 +1850,42 @@ class FC_RNN(nn.Module):
     def forward(self, x):
         B, L = x.shape
         if self.hidden_state == None:
-            h_t_prev = Variable(torch.zeros(B, self.hidden_size)).cuda()
+            self.hidden_state = Variable(torch.zeros(B, self.hidden_size)).cuda()
             
         h1 = self.fc_in(x)
-        h2 = self.fc_h(h_t_prev)
-        h_t = F.relu(h1 + h2)
-        h_t_prev = h_t        
+        h2 = self.fc_h(self.hidden_state)
+        h_t = torch.tanh(h1 + h2)
+        self.hidden_state = h_t     
         
         return h_t
+
+class WW_rnn(nn.Module):
+    def __init__(self, input_shape, hidden_shape, h_op = WhereMix, 
+                 in_op = WhereMix):
+        super(WW_rnn, self).__init__()
+        self.input_shape = input_shape
+        self.hidden_shape = hidden_shape
+        self.hidden_state = None
+
+        self.WW_in = in_op(input_shape, hidden_shape)
+        self.WW_h = h_op(hidden_shape, hidden_shape)
+        
+    def reset(self, batch_size):
+        self.hidden_state = None
+
+    def forward(self, x):
+        B, _, _ = x.shape
+        if self.hidden_state == None:
+            self.hidden_state = Variable(
+                    torch.zeros((B,)+ self.hidden_shape)).cuda()
+            
+        h1 = self.WW_in(x)
+        h2 = self.WW_h(self.hidden_state)
+        h_t = torch.tanh(h1 + h2)
+        self.hidden_state = h_t     
+        
+        return h_t
+
 
 class laRNN(nn.Module):
     """RNN as described in the lookahead paper"""
