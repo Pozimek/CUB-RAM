@@ -18,6 +18,7 @@ import os
 torch.pi = torch.acos(torch.zeros(1)).item() * 2
 
 # converts a nested dict to a nested object for ease of access
+###TODO: fix duplicate entries bug (not critical)
 class conf:
     def __init__(self, D):
         self.__D__ = D

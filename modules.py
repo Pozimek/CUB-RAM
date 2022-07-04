@@ -217,7 +217,7 @@ class crude_retina(RAM_sensor):
         self.g = g
         self.k = k
         self.s = s
-        self.width = g*(s**(k-1))
+        self.width = int(g*(s**(k-1)))
         self.gpu = gpu
         self.sigma = np.pi*s
         self.lowpass = False #TODO: fix sigma formula. Lowpass off until then
@@ -1167,7 +1167,8 @@ class WW_module(nn.Module):
         self.spatial = in_shape[1:]
         self.W = nn.Parameter(
                 torch.FloatTensor(torch.Size((1,1,)+self.spatial+(out_channels,))))
-        torch.nn.init.xavier_uniform_(self.W) #XXX decide on init
+#        torch.nn.init.xavier_uniform_(self.W) #XXX decide on init
+        torch.nn.init.kaiming_uniform_(self.W)
         
         self.out_shape = torch.Size((k*in_shape[0],out_channels))
     

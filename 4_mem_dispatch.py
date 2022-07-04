@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Mon May 30 01:48:39 2022
+Created on Tue Jun 14 03:35:13 2022
 
 Chapter 4 (active vision memory, ch3 in latex) experiment dispatch script.
 
-!!! DEPRECATED !!!
-
-Experiment 2: evaluating different recurrent memory variants.
+Experiment focus: evaluating different recurrent memory variants.
 WW_LSTM vs WW_RNN vs LSTM vs RNN
 
-Script trains all models on 3 timesteps. 4iii_eval.py evaluates them
-appropriately.
-
-Notes:
-- More justice: varying where_dim
-- Old WW stuff was fovonly, so it performed better.
-- RAM_ch4 has been revised since, so this script might not run now.
-
-Result: training memory with T=3 and evaluating at T=1,2,3 was a mistake, and
-so the results from this script were not used in the dissertation in their 
-entirety.
+Using the multiple instances MHL method, ie trains a separate instance for 
+every timestep.
 
 @author: piotr
 """
@@ -50,9 +39,10 @@ def main(config):
                                        std=[0.5, 0.5, 0.5])]) 
     
     # Build name based on architecture variant for current experiment
-    config.name = "ch4iii"
+    config.name = "ch4mem"
     config.name += "-s{}".format(config.seed)
     config.name += "VAR{}".format(int(config.vars.variant))
+    config.name += "T{}".format(int(config.vars.timesteps))
     
     dataset = CUBDataset(transform = transform, shuffle=True)
     generator = torch.Generator()
@@ -73,18 +63,18 @@ def main(config):
     if config.vars.variant <= 1: #WW variants
         WWfov = WW_module(FE.out_shape, where_dim)
         WWper = WW_module(FE.out_shape, where_dim)
-        mem_in = WWfov.out_shape[:-1] + (WWfov.out_shape[-1]*2,)
+        mem_in = WWfov.out_shape[:-1] + (WWfov.out_shape[-1],)
         mem_shape = mem_in
         classifier_in = mem_shape.numel()
     else: #non-WW variants
         WWfov = nn.AdaptiveAvgPool2d((1,1))
         WWper = nn.AdaptiveAvgPool2d((1,1))
-        mem_in = FE.out_shape[0]*2
+        mem_in = FE.out_shape[0]
         mem_shape = FE.out_shape[0] #small, for closer param # to WW variants
         classifier_in = mem_shape
     
     # Memory
-    mem_variants = [partial(WW_LSTM, mem_in, FE.out_shape[0], where_dim*2, 
+    mem_variants = [partial(WW_LSTM, mem_in, FE.out_shape[0], where_dim, 
                             gate_op=WhereMix, in_op=WhereMix),
                     partial(WW_rnn, mem_in, mem_shape),
                     partial(lstm_, mem_in, mem_shape),
@@ -97,6 +87,7 @@ def main(config):
     
     model = RAM_ch4(config.name, retina, FE, WWfov, WWper, memory, classifier,
                     gpu=True)
+    model.set_timesteps(config.vars.timesteps)
     
     trainer = Trainer(config, loader, model)
     trainer.train()
@@ -104,10 +95,12 @@ def main(config):
 if __name__ == '__main__':
     for seed in [1,9,919]:
         for variant in range(4):
-            config = get_ymlconfig('./4iii_dispatch.yml')
-            config.seed = seed
-            # 0:WW_LSTM, 1:WW_RNN, 2:LSTM 3:RNN
-            config.vars.variant = variant
-            
-#            config.training.resume = True
-            main(config)
+            for timesteps in [1,2,3]:
+                config = get_ymlconfig('./4_mem_dispatch.yml')
+                config.seed = seed
+                # 0:WW_LSTM, 1:WW_RNN, 2:LSTM 3:RNN
+                config.vars.variant = variant
+                config.vars.timesteps = timesteps
+                
+    #            config.training.resume = True
+                main(config)
