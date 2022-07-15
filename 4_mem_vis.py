@@ -87,7 +87,7 @@ for variant in parsed.keys():
 #(not for time or lr)
 NA = ['Time elapsed', 'LR']
 tags = list(TAGS.values())
-_ = [tags.remove(i) for i in NA] #not present in EVAL_TAGS
+_ = [tags.remove(i) for i in NA]
 
 STATS = {}
 for variant in parsed.keys():
