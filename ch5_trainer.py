@@ -50,7 +50,8 @@ class Trainer(object):
         self.es_acc = 0.
         self.counter = 0
         self.lr = C.training.init_lr
-        self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=5e-3)
+        self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9, 
+                                   weight_decay=5e-3)
         self.lr_scheduler = ReduceLROnPlateau(self.optimizer, mode='max', 
                                               factor = 0.5, patience=5, 
                                               threshold = 1.0, threshold_mode='abs')

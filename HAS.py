@@ -37,7 +37,7 @@ class HAS(nn.Module):
     it rolls off and how flat the peak is). Default: 80
     - width: the approximate width of the attentional spotlight. Default: 37
     """
-    def __init__(self, out_shape, width = 37, a=0.98):
+    def __init__(self, out_shape, width = 37, a = 0.98):
         super(HAS, self).__init__()
         assert width%2==1
         assert width!=1
@@ -56,6 +56,7 @@ class HAS(nn.Module):
         self.d = None
         
     def modGauss(self, tensor, a, f, c):
+        """Generalized Gaussian"""
         return a * torch.exp(-(tensor**f)/(2*c**2))
         
     def forward(self, coords):
@@ -84,14 +85,11 @@ Goal: maximize the intensity of pixels captured by the spotlight.
 NOTES:
 - Local minimas exist and are a problem to the toy example. Would they also 
 pose a problem in deployment?
-- You can actually plot out the entire gradient map over a grid of x,y values.
-- what if the spotlight makes the gradients favour optimizing locally at the 
-expense of finding a global solution? Although this already seems to be the 
-case with only the support
-- xy coord optimisation is continuous, but fixations are discrete. Is this an 
-issue?
+- You can actually plot out the entire gradient map over a grid of x,y values
+as a flow map.
 """
 set_seed(9001)
+size = (7,7) #matplotlib img size
 
 # set up the scene and the HAS layer
 shape = (37,37)
@@ -106,6 +104,8 @@ coords = nn.Parameter(torch.tensor([36.0,36.0])) #starting location
 showTensor(layer(coords).detach())
 opt = optim.SGD([coords], lr=0.05)
 last_loss = 0
+
+showTensor(layer(coords))
 
 steps = 100000
 print("target xy: ", blob)
@@ -124,7 +124,7 @@ for i in range(steps):
     if i%1000 == 0: 
         print("T{}, loss: {}, xy: ({:.2f}, {:.2f})".format(
             i, loss, coords[0].item(), coords[1].item()))
-        showTensor(output.detach())
+        showTensor(output.detach(), size=size)
     
     # validate for nans and infs
     if not (validate_values(attention) and validate_values(attention.grad) and
@@ -143,9 +143,9 @@ for i in range(steps):
     opt.zero_grad()
     last_loss = loss
 
-showTensor(scene.detach())
-showTensor(attention.detach())
-showTensor(output.detach())
+showTensor(scene.detach(), size=size)
+showTensor(attention.detach(), size=size)
+showTensor(output.detach(), size=size)
 #py, px = 2, 2
 #print_patch(attention, py, px, w=5)
 #print_patch(output, py, px, w=5)

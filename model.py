@@ -234,8 +234,9 @@ class SpaCat(nn.Module):
         for t in range(self.timesteps):
             # Extract and concatenate patches
             phi = self.retina.foveate_ego(x, l_t_prev)
-            glimpses.append(torch.cat([phi[:,0], phi[:,1]], 2)) #cat fov+per along Ydim
-            mem = torch.cat(glimpses, dim=3).squeeze() 
+            glimpse = torch.cat([phi[:,0], phi[:,1]], 2) if self.retina.k > 1 else phi[:,0]
+            glimpses.append(glimpse) 
+            mem = torch.cat(glimpses, dim=3).squeeze() #time dim cat
             mem = F.pad(mem, (0, self.FE_in_shape[-1]-mem.shape[-1]))
             
 #            mem[:, :, :, t*self.retina.g : (t+1)*self.retina.g] = glimpses[t] #cat mem along Xdim
@@ -386,8 +387,11 @@ class RAM_ch5(nn.Module):
             
             # WW
             WWfov = F.relu(self.WWmodule_fov(features[0]))
-            WWper = F.relu(self.WWmodule_per(features[1]))
-            WW = torch.cat([WWfov,WWper], 2) #cat along where_dim
+            if self.retina.k > 1:
+                WWper = F.relu(self.WWmodule_per(features[1]))
+                WW = torch.cat([WWfov,WWper], 2) #cat along where_dim
+            else:
+                WW = WWfov
             
             # memory and downstream
             h_t = self.memory(WW)

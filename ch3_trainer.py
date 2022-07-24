@@ -49,7 +49,8 @@ class Trainer(object):
         self.es_acc = 0.
         self.counter = 0
         self.lr = C.training.init_lr
-        self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9, weight_decay=5e-3)
+        self.optimizer = optim.SGD(params, lr=self.lr, momentum=0.9, 
+                                   weight_decay=5e-3)
         self.lr_scheduler = lr_scheduler.StepLR(self.optimizer, 
                                                 step_size=10, gamma=0.5)
         # tensorboard logging
