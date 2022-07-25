@@ -10,6 +10,7 @@ Hardcoded Attentional Spotlight
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import numpy as np
 
 from utils import showTensor, set_seed, validate_values, print_patch, ir, d
 
@@ -74,8 +75,8 @@ class HAS(nn.Module):
         # add spotlight
         from_y, to_y = ir(coords[1].item())-self.width//2, ir(coords[1].item()) + 1 + self.width//2
         from_x, to_x = ir(coords[0].item())-self.width//2, ir(coords[0].item()) + 1 + self.width//2
-#        support[from_y:to_y, from_x:to_x] += self.modGauss(d[from_y:to_y, from_x:to_x].detach(), self.a, self.f, self.c)
-        support[from_y:to_y, from_x:to_x] += self.a
+##        support[from_y:to_y, from_x:to_x] += self.modGauss(d[from_y:to_y, from_x:to_x].detach(), self.a, self.f, self.c)
+#        support[from_y:to_y, from_x:to_x] += self.a
         return support
 
 """ 
@@ -83,72 +84,106 @@ TEST: can the spotlight learn to fixate on a hot spot?
 Goal: maximize the intensity of pixels captured by the spotlight.
 
 NOTES:
-- Local minimas exist and are a problem to the toy example. Would they also 
+- Local minimas exist and are an occasional problem to the toy example. Would they also 
 pose a problem in deployment?
 - You can actually plot out the entire gradient map over a grid of x,y values
 as a flow map.
 """
-set_seed(9001)
-size = (7,7) #matplotlib img size
 
-# set up the scene and the HAS layer
-shape = (37,37)
-layer = HAS(shape, width=3)
-scene = torch.randn(shape)*5
-blob = [1,1] #expecting backprop to shift xy to these values
-scene[blob[1]-1:blob[1]+2, blob[0]-1:blob[0]+2] = 40
-showTensor(scene)
-
-# set up the parameters and optimizer
-coords = nn.Parameter(torch.tensor([36.0,36.0])) #starting location
-showTensor(layer(coords).detach())
-opt = optim.SGD([coords], lr=0.05)
-last_loss = 0
-
-showTensor(layer(coords))
-
-steps = 100000
-print("target xy: ", blob)
-print("starting xy: ", coords.tolist())
-for i in range(steps):
-    # forward pass
-    attention = layer(coords)
-    attention.retain_grad()
-    output = attention * scene
+def main(seed):
+    size = (5,5) #matplotlib img size
+    v = 0 #whether to visualize progress with images
     
-    # compute loss and update parameters
-    loss = -output.sum()
-    loss.backward(retain_graph=True)
-    opt.step()
+    # Experiment params
+    set_seed(seed)
+    LR = 0.06
+    coords = nn.Parameter(torch.tensor([36.0,36.0])) #starting location
+    shape = (37,37)
+    tolerance = shape[0]/40 # max tolerated distance from blob 
+    layer = HAS(shape, width=3)
+    scene = torch.randn(shape)
+#    scene = torch.rand(shape)
+    blob = [1,1] #expecting backprop to shift xy to these values
+    scene[blob[1]-1:blob[1]+2, blob[0]-1:blob[0]+2] = 40
+    max_steps = 50000
     
-    if i%1000 == 0: 
-        print("T{}, loss: {}, xy: ({:.2f}, {:.2f})".format(
-            i, loss, coords[0].item(), coords[1].item()))
+    # set up the parameters and optimizer
+    opt = optim.SGD([coords], lr=LR)
+    last_loss = 0
+    
+    # logging
+    dist_log = []
+    first_loss = None
+    loss_log = []
+    
+    if v:
+        showTensor(layer(coords).detach(), size=size)
+        showTensor(scene, size=size)
+    print("target xy: ", blob)
+    print("starting xy: ", coords.tolist())
+    for i in range(max_steps):
+        # forward pass
+        attention = layer(coords)
+        attention.retain_grad()
+        output = attention * scene
+        
+        # compute loss and update parameters
+        loss = -output.sum()
+        if first_loss is None: first_loss = loss
+        loss.backward(retain_graph=True)
+        opt.step()
+        if i%5000 == 0: 
+            print("T{}, loss: {}, xy: ({:.2f}, {:.2f})".format(
+                i, loss, coords[0].item(), coords[1].item()))
+            if v: showTensor(output.detach(), size=size)
+        
+        # validate for nans and infs
+        if not (validate_values(attention) and validate_values(attention.grad) and
+                validate_values(output) and validate_values(coords) and 
+                validate_values(coords.grad)):
+            print("Invalid values detected.")
+            break
+        distance = d(torch.tensor(blob) - coords)
+        # end early if close enough or if stuck in a local minima
+        if distance < tolerance or last_loss == loss:
+            print("T{}, loss: {}, xy: ({:.2f}, {:.2f})".format(
+                i, loss, coords[0].item(), coords[1].item()))
+            print("Early stopping at T{}".format(i))
+            break
+        
+        opt.zero_grad()
+        if i != max_steps-1: last_loss = loss
+        
+        # LOGS
+        #distance to blob coordinates
+        dist_log.append(distance.item())
+        #loss change, ie loss - initial loss
+        loss_log.append((loss-first_loss).detach().item())
+    
+    print("Final distance: {}".format(d(torch.tensor(blob) - coords)))
+    if last_loss == loss: print("**LOCAL MINIMA**")
+    if distance < tolerance: print("**CLOSE ENOUGH**")
+    else: print("**FAILED**")
+    if v:
+        showTensor(scene.detach(), size=size)
+        showTensor(attention.detach(), size=size)
         showTensor(output.detach(), size=size)
+    #py, px = 2, 2
+    #print_patch(attention, py, px, w=5)
+    #print_patch(output, py, px, w=5)
+    #print_patch(layer.d, py, px, w=5)
+    #print_patch(layer.d.grad, py, px, w=5)
+    #print_patch(scene, py, px, w=5)
     
-    # validate for nans and infs
-    if not (validate_values(attention) and validate_values(attention.grad) and
-            validate_values(output) and validate_values(coords) and 
-            validate_values(coords.grad)):
-        print("Invalid values detected.")
-        break
+    return dist_log, loss_log
     
-    # end early if close enough or if stuck in a local minima
-    if d(torch.tensor(blob) - coords) < 0.1 or last_loss == loss:
-        print("T{}, loss: {}, xy: ({:.2f}, {:.2f})".format(
-            i, loss, coords[0].item(), coords[1].item()))
-        print("Early stopping at T{}".format(i))
-        break
+if __name__ == '__main__':
+    D = {}
+    for seed in [1,3,6,9,919,9001,12345,42,1337,1984]:
+        dist_log, loss_log = main(seed)
+        D[seed] = {"dist_log":dist_log, 
+                   "loss_log":loss_log}
     
-    opt.zero_grad()
-    last_loss = loss
-
-showTensor(scene.detach(), size=size)
-showTensor(attention.detach(), size=size)
-showTensor(output.detach(), size=size)
-#py, px = 2, 2
-#print_patch(attention, py, px, w=5)
-#print_patch(output, py, px, w=5)
-#print_patch(layer.d, py, px, w=5)
-#print_patch(layer.d.grad, py, px, w=5)
-#print_patch(scene, py, px, w=5)
+    # Save
+    fname = 'stats_ch5HAS.npy'
+    np.save(fname,D)
