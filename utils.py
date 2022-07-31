@@ -71,10 +71,10 @@ def memshow():
  
     
 #pyplot visualisation
-def showArray(array, size=(8,8), cmap = None):
+def showArray(array, size=(8,8), cmap = None, **imargs):
     plt.figure(figsize=size)
     plt.axis('off')
-    plt.imshow(array, interpolation='none', cmap=cmap)
+    plt.imshow(array, **imargs, interpolation='none', cmap=cmap)
     plt.show()
 
 def showPIL(PIL, size=(8,8), cmap=None):
@@ -87,10 +87,10 @@ def showFixedTensor(tensor, size = (8,8), cmap = None, bgr2rgb = False):
     if bgr2rgb: fixed = fixed[:,:,[2,1,0]]
     showTensor(fixed, size, cmap)
     
-def showTensor(tensor, size=(8,8), cmap=None):
+def showTensor(tensor, size=(8,8), cmap=None, **imargs):
     if tensor.device.type == 'cuda': tensor = tensor.cpu()
     array = tensor.detach().numpy()
-    showArray(array, size, cmap)
+    showArray(array, size, cmap, **imargs)
  
 #OH BOY PYTHON 3 SURELY HURTS
 def normal_round(n):

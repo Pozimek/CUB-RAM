@@ -117,7 +117,7 @@ def main(seed):
     loss_log = []
     
     if v:
-        showTensor(layer(coords).detach(), size=size)
+#        showTensor(layer(coords).detach(), size=size)
         showTensor(scene, size=size)
     print("target xy: ", blob)
     print("starting xy: ", coords.tolist())
@@ -132,10 +132,13 @@ def main(seed):
         if first_loss is None: first_loss = loss
         loss.backward(retain_graph=True)
         opt.step()
-        if i%5000 == 0: 
+        if i%1500 == 0:
+            if v: 
+                showTensor(attention.detach(), size=size)
+                showTensor(output.detach(), size=size, vmin=-0.1, vmax=0.1)
             print("T{}, loss: {}, xy: ({:.2f}, {:.2f})".format(
                 i, loss, coords[0].item(), coords[1].item()))
-            if v: showTensor(output.detach(), size=size)
+            
         
         # validate for nans and infs
         if not (validate_values(attention) and validate_values(attention.grad) and
@@ -165,9 +168,10 @@ def main(seed):
     if distance < tolerance: print("**CLOSE ENOUGH**")
     else: print("**FAILED**")
     if v:
-        showTensor(scene.detach(), size=size)
         showTensor(attention.detach(), size=size)
-        showTensor(output.detach(), size=size)
+        showTensor(output.detach(), size=size, vmin=-0.2, vmax=0.2)
+        print("T{}, loss: {}, xy: ({:.2f}, {:.2f})".format(
+                i, loss, coords[0].item(), coords[1].item()))
     #py, px = 2, 2
     #print_patch(attention, py, px, w=5)
     #print_patch(output, py, px, w=5)
@@ -185,5 +189,5 @@ if __name__ == '__main__':
                    "loss_log":loss_log}
     
     # Save
-    fname = 'stats_ch5HAS.npy'
-    np.save(fname,D)
+#    fname = 'stats_ch5HAS.npy'
+#    np.save(fname,D)
